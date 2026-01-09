@@ -29,6 +29,7 @@ This all-in-one tool will combine multiple preprocessing steps:
 - STEP 4: replace circle-like polygons (from metal or result of via array merging) by octagons
 
 Starting from the example above, the resulting cleaned and simplified GDSII then looks like this:
+
 [<img src="./doc/png/cleaned_gds.png" width="800" />](cleaned gds)
 
 
