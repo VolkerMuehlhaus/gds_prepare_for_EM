@@ -1,0 +1,4 @@
+gdspy
+rtree
+numpy
+shapely>=2.0

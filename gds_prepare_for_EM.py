@@ -1,86 +1,118 @@
+# Prepare IHP SG13G2 GDSII layout for EM simulation: an all-in-one pipeline
+# combining cutout removal, periphery ring/frame deletion, via-array
+# simplification, round-pad-to-octagon conversion, and floating-fill removal.
+
+########################################################################
+#
+# Copyright 2025 Volker Muehlhaus and IHP PDK Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+########################################################################
+
+import argparse
+import os
+import tempfile
 import gdspy
-import sys
-from collections import defaultdict, Counter
+from collections import defaultdict
 from rtree import index  # pip install rtree
 import numpy as np
-import math
+from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.ops import unary_union
+
+from gds_geometry_utils import (
+    decompose_polygon_holes,
+    is_circle_like,
+    simplify_round_polygon_to_octagon,
+    is_ring_candidate,
+    detect_and_delete_periphery_rings,
+)
+
+__version__ = "1.0"
+
+# a polygon-with-hole where the hole covers this much of the exterior area
+# is treated as a thin ring, not "fill with cutout" - it gets deleted
+# instead of replaced by a solid shape
+RING_HOLE_FRACTION_THRESHOLD = 0.90
 
 
-# only metals from this layer list are included in output file
-metal_layers_list = [
-  1,
-  8,
-  9,
-  10,
-  30,
-  36,
-  41, 
-  50,
-  67,
-  126,
-  134
-]
+# Step 1: single source of truth for layer number <-> name. To adapt this
+# tool to a different PDK/layer stack, edit this table (and VIA_ABOVE_BELOW
+# below) - everything else derives from these two.
+LAYER_NAMES = {
+  1: "Activ",
+  6: "Cont",
+  8: "Metal1",
+  9: "Passiv",
+  10: "Metal2",
+  19: "Via1",
+  29: "Via2",
+  30: "Metal3",
+  36: "MIM",
+  41: "Pillar",
+  49: "Via3",
+  50: "Metal4",
+  66: "Via4",
+  67: "Metal5",
+  125: "TopVia1",
+  126: "TopMetal1",
+  129: "Vmim",
+  133: "TopVia2",
+  134: "TopMetal2",
+}
+NAME_TO_LAYER = {name: layer for layer, name in LAYER_NAMES.items()}
 
+# Step 2: real vias, by name - which metal layer sits above/below each. This
+# alone defines "which named layers are (real) vias" - no separate via-name
+# list needed, it's just VIA_ABOVE_BELOW's keys.
+VIA_ABOVE_BELOW = {
+  "Cont":    ("Metal1", "Activ"),
+  "Via1":    ("Metal2", "Metal1"),
+  "Via2":    ("Metal3", "Metal2"),
+  "Via3":    ("Metal4", "Metal3"),
+  "Via4":    ("Metal5", "Metal4"),
+  "Vmim":    ("TopMetal1", "MIM"),
+  "TopVia1": ("TopMetal1", "Metal5"),
+  "TopVia2": ("TopMetal2", "TopMetal1"),
+}
+# Passiv and Pillar aren't real vias (no above/below - never via-merged) but
+# are still via-like for fill-removal purposes: excluded from floating-fill
+# removal same as a real via, while also getting cutout/circle detection
+# like a metal layer.
+EXTRA_VIA_LIKE_NAMES = ["Passiv", "Pillar"]
+
+# only metals from this layer list are included in output file. Everything
+# in LAYER_NAMES that isn't a real via (VIA_ABOVE_BELOW) is a metal layer -
+# no separate metal-name list needed either.
+metal_layers_list = [NAME_TO_LAYER[name] for name in LAYER_NAMES.values() if name not in VIA_ABOVE_BELOW]
 
 # Via layers to be excluded from floating polygon removal
-via_layers_list = [
-  6,  # Cont
-  19, # Via1
-  29, # Via2
-  49, # Via3
-  66, # Via4 
-  129,# Vmim
-  125,# TopVia1
-  133, # TopVia2
-  41, # dfpad:pillar
-  9  # Passiv
-]
+via_layers_list = [NAME_TO_LAYER[name] for name in list(VIA_ABOVE_BELOW) + EXTRA_VIA_LIKE_NAMES]
 
 
 # layers in this purpose list are EXCLUDED from output file
 exclude_purpose_list = [
   20, # noqrc
   22, # filler
-  23, # nofill   
+  23, # nofill
   32 # block
 ]
 
 # Layers above the via layer
-layer_above_dict = {
-  6:  8,  # Cont
-  19: 10, # Via1
-  29: 30, # Via2
-  49: 50, # Via3
-  66: 67, # Via4 
-  129: 126,# Vmim
-  125: 126,# TopVia1
-  133: 134 # TopVia2
-}
+layer_above_dict = {NAME_TO_LAYER[via]: NAME_TO_LAYER[above] for via, (above, below) in VIA_ABOVE_BELOW.items()}
 
 # Layers below the via layer
-layer_below_dict = {
-  6:  1, # Cont
-  19: 8, # Via1
-  29: 10, # Via2
-  49: 30, # Via3
-  66: 50, # Via4 
-  129: 36,# Vmim
-  125: 67,# TopVia1
-  133: 126 # TopVia2
-}
-
-
-# Via spacings to be merged, use large values to TopVia1,TopVia2 to get Pad vias also
-via_spacings_dict = {
-  6:  1,   # Cont
-  19: 1, # Via1
-  29: 1, # Via2
-  49: 2, # Via3
-  66: 4, # Via4 
-  129: 2.0,# Vmim
-  125: 5.0,# TopVia1, large distance for pads
-  133: 7.0 # TopVia2, large distance for pads
-}
+layer_below_dict = {NAME_TO_LAYER[via]: NAME_TO_LAYER[below] for via, (above, below) in VIA_ABOVE_BELOW.items()}
 
 
 # ----------------------------------------------
@@ -99,17 +131,24 @@ def bbox_size(poly, tol=1e-6):
     h = round((ymax - ymin) / tol) * tol
     return (w, h)
 
-def touches_any(poly, rtree_idx, all_polys, minsize, maxsize, precision=1e-5):
+def touches_any(poly, rtree_idx, all_polys, precision=1e-5):
     """
     Return True if poly touches or intersects any other polygon in all_polys.
-    Return false if polygon size < minsize or > maxsize
+
+    Any touching neighbor counts as a real connection, including a
+    same-size one: identical-size polygons that touch each other must not
+    be treated as fill and deleted, since real connected metal (e.g. a
+    Metal1/Metal2 mesh or ground plane) is often built from many touching
+    copies of the same unit tile too. To correctly tell a genuinely
+    floating cluster of touching same-size fill units apart from real
+    connected metal made of the same-size tiles, run
+    merge_polygons_by_layer() on the cell *before* calling
+    find_isolated_same_size_polygons_by_layer(): merging fuses each
+    connected cluster into a single polygon first, so the isolation test
+    here only ever has to ask "does this (already-merged) shape touch
+    anything else" - which is unambiguous.
     """
     (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
-    
-    size_x = xmax-xmin
-    size_y = ymax-ymin
-    if size_x<minsize or size_y<minsize or size_x>maxsize or size_y>maxsize:
-        return True # don't check these, treat as not isolated
 
     candidate_ids = list(rtree_idx.intersection((xmin, ymin, xmax, ymax)))
 
@@ -125,14 +164,44 @@ def touches_any(poly, rtree_idx, all_polys, minsize, maxsize, precision=1e-5):
     return False  # isolated
 
 
-def find_isolated_same_size_polygons_by_layer(cell, layers_list, minsize=1, maxsize=40, mincount=20, size_tol=1e-6 ):
+def find_isolated_same_size_polygons_by_layer(cell, layers_list, minsize=1, maxsize=None, mincount=20, size_tol=1e-6 ):
     """
-    Flatten the hierarchy and return:
-        {layer: {size: [isolated polygons]}}
+    Flatten the hierarchy and remove isolated (floating) polygons that
+    repeat with the same bounding-box size at least `mincount` times on a
+    layer - this is the signature of auto-generated or man-made dummy
+    metal fill. A same-size group with fewer than `mincount` members is
+    left untouched even if isolated, since it's more likely to be
+    deliberate design content than repetitive fill.
+
+    IMPORTANT: run merge_polygons_by_layer() on `cell` before calling this.
+    Isolation here means "touches nothing else at all", including a
+    same-size neighbor - identical-size polygons that touch each other
+    must not be deleted, since real connected metal (e.g. a Metal1/Metal2
+    mesh or ground plane) is frequently built from many touching copies of
+    the same unit tile too, same as dummy fill is. The only way to tell
+    a genuinely floating cluster of touching same-size fill units apart
+    from real connected metal made of the same-size tiles is to merge
+    first: merging fuses every connected cluster (fill or real metal)
+    into a single polygon, so a floating fill cluster becomes its own
+    small isolated shape while a real connected network merges into one
+    (or a few) large, usually uniquely-shaped/sized polygon(s) that won't
+    match the same-size-repeat-count fill signature. Calling this on
+    unmerged geometry is exactly what caused whole real metal layers to
+    be wiped out in an earlier version - don't skip the merge step.
+
+    Gating on repeat count (rather than a fixed absolute size ceiling)
+    generalizes across layers/layouts automatically: a size that
+    legitimately repeats often enough is treated as fill regardless of
+    its absolute micron size, and groups below mincount are skipped
+    before running the (relatively expensive) isolation test at all -
+    so a large one-off shape, which can never reach mincount, is never
+    tested. `maxsize` remains available as an optional manual cap for
+    cases where you want to exclude large sizes outright regardless of
+    repeat count; leave it as None to rely on mincount alone (the
+    default, and the recommended setting for most layouts).
+
     Only considers polygons on the same layer for isolation.
     """
-    # print(f"Removing floating metal with size {minsize} between and {maxsize} units, layers {layers_list}")
-
     # create new library with new cell to hold polygons that are NOT removed
     new_lib = gdspy.GdsLibrary()
     new_cell = gdspy.Cell(cell.name + "_cleaned")
@@ -167,47 +236,47 @@ def find_isolated_same_size_polygons_by_layer(cell, layers_list, minsize=1, maxs
         # only check if not via layer
         if layer in layers_list:
 
-            # Compute sizes
-            size_data = []
-            for poly in all_polys:
-                size = bbox_size(poly, tol=size_tol)
-                size_data.append((poly, size))
-
-            # Group by size
             groups = defaultdict(list)
-            for poly, size in size_data:
-                groups[size].append(poly)
+            for poly in all_polys:
+                groups[bbox_size(poly, tol=size_tol)].append(poly)
 
-            # Build R-tree for the layer
+            # Build R-tree for the whole layer once, used by any size group
+            # that passes the cheap pre-filters below
             rtree_idx = index.Index()
             for i, poly in enumerate(all_polys):
                 (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
                 rtree_idx.insert(i, (xmin, ymin, xmax, ymax))
 
-            # Filter isolated polygons
             isolated = {}
             for size, polys in groups.items():
+                w, h = size
+
+                # cheap pre-filters, avoid the isolation test entirely when
+                # the group can't possibly qualify for removal
+                below_mincount = len(polys) < mincount
+                below_minsize = w < minsize or h < minsize
+                above_maxsize = maxsize is not None and (w > maxsize or h > maxsize)
+                if below_mincount or below_minsize or above_maxsize:
+                    for poly in polys:
+                        new_cell.add(poly)
+                    continue
+
                 keep = []
                 for poly in polys:
-                    if touches_any(poly, rtree_idx, all_polys, minsize=minsize, maxsize=maxsize):
+                    if touches_any(poly, rtree_idx, all_polys, precision=1e-5):
                         new_cell.add(poly)
-                    else:    
+                    else:
                         keep.append(poly)
-                if keep:
+
+                if len(keep) >= mincount:
                     isolated[size] = keep
+                else:
+                    # not enough of them actually turned out isolated - keep them all
+                    for poly in keep:
+                        new_cell.add(poly)
+
             if isolated:
                 isolated_per_layer[layer] = isolated
-
-            # Now repeat that, and keep polygons with a size that appears nore more than 20 times in isolation on that layer
-            for size, polys in groups.items():
-                if isolated:
-                    # if this size is isolated, check how often it appears
-                    isolated_list = isolated.get(size, None)
-                    if isolated_list is not None:
-                        num_this_size = len(isolated_list)
-                        if num_this_size < mincount:
-                            for poly in polys:
-                                new_cell.add(poly)
 
         else:
             # via layer, append with no changes
@@ -217,8 +286,7 @@ def find_isolated_same_size_polygons_by_layer(cell, layers_list, minsize=1, maxs
     for layer, layer_data in isolated_per_layer.items():
         print(f"Layer {layer}:")
         for size, polys in layer_data.items():
-            if len(polys)>mincount:
-                print(f"    Size ({size[0]:.2f},{size[1]:.2f}): found {len(polys)} isolated polygons")
+            print(f"    Size ({size[0]:.2f},{size[1]:.2f}): removed {len(polys)} isolated polygons")
 
     new_lib.add(new_cell)
     return new_lib
@@ -231,41 +299,125 @@ def find_isolated_same_size_polygons_by_layer(cell, layers_list, minsize=1, maxs
 # Helper functions for via array merging
 # ----------------------------------------------
 
-def merge_via_array (polygons, maxspacing):
-  """Used internally in processing data from gdspy, does not work on our own all_polygons_list class!
+def _rtree_from_shapely_polygons(shapely_polys):
+  rtree_idx = index.Index()
+  for i, poly in enumerate(shapely_polys):
+    rtree_idx.insert(i, poly.bounds)
+  return rtree_idx
 
-  Args:
-      polygons (_type_): LPPpolylist data
-      maxspacing (float): offset for oversize/undersize of polygons during via array merge
 
-  Returns:
-      _type_: LPPpolylist data
+def _best_overlapping_polygon(test_poly, rtree_idx, shapely_polys):
   """
+  Return the index of the polygon in shapely_polys that overlaps
+  test_poly the most (by area), or None if nothing overlaps it. Using
+  actual overlap area (not just centroid containment) correctly handles a
+  via that straddles the edge of a non-convex metal shape.
+  """
+  candidate_ids = rtree_idx.intersection(test_poly.bounds)
+  best_idx = None
+  best_area = 0.0
+  for cid in candidate_ids:
+    candidate = shapely_polys[cid]
+    if not candidate.intersects(test_poly):
+      continue
+    overlap_area = candidate.intersection(test_poly).area
+    if overlap_area > best_area:
+      best_area = overlap_area
+      best_idx = cid
+  return best_idx
 
-  # Via array merging consists of 3 steps: oversize, merge, undersize
-  # Value for oversize depends on via layer
-  # Oversized vias touch if each via is oversized by half spacing
-  
-  offset = maxspacing/2 + 0.01
 
-  if len(polygons)>10:
-     precision = maxspacing/10
-  else:   
-     precision = 0.1
+def merge_via_array_by_metal_overlap(via_polygons, above_polygons, below_polygons):
+  """
+  Replace a via array with clean, low-vertex solid via-region shapes.
 
-  offsetpolygonset=gdspy.offset(polygons, offset, join='miter', tolerance=2, precision=precision, join_first=True, max_points=999)
-  mergedpolygonset=gdspy.boolean(offsetpolygonset, None,"or", max_points=999)
-  mergedpolygonset=gdspy.offset(mergedpolygonset, -offset, join='miter', tolerance=2, precision=precision, join_first=False, max_points=999)
+  Rather than growing/merging/shrinking via shapes by a manually chosen
+  spacing (which traces a jagged boundary around the individual via
+  positions), this groups the vias by which metal-above polygon and which
+  metal-below polygon each one actually lands in. For every (above, below)
+  polygon pair that has at least one real via connecting them, it outputs
+  the overlap of three things: that specific metal-above polygon, that
+  specific metal-below polygon, AND the convex hull of the actual via
+  positions in that group.
 
+  The via-position hull matters: metal-above and metal-below can overlap
+  over a much bigger area than the (possibly sparse, even a single via)
+  cluster that actually connects them there - e.g. two wide routing
+  strips that cross and are joined by one via. Clipping only to the
+  above/below overlap would fill that whole crossing area with via
+  material, wildly overstating the real via footprint. Intersecting with
+  the via-position hull as well keeps the result close to where vias
+  actually are.
 
+  This directly satisfies most of the properties we want, with no manual
+  distance parameter:
+  - the merge is naturally capped at "as large as the metal above and
+    below actually allow, and no bigger than where vias really are".
+  - vias belonging to different metal-above or metal-below polygons are
+    never merged together: distinct (above, below) pairs always produce
+    separate output shapes, so a merged via region can never bridge two
+    unrelated metal shapes.
 
+  A convex hull is NOT always low-vertex, though: that's only true for a
+  roughly rectangular via grid (hull = its 4-8 corners). A via array
+  arranged to fill a disk/circular footprint (matching a round pad above
+  it) has most of its via positions sitting on the hull, so the hull
+  traces a jagged staircase approximation of the circle - dozens to
+  hundreds of vertices, confirmed on a real 598-via cluster. Simplifying
+  the hull (Douglas-Peucker, tolerance scaled to the cluster's own size)
+  fixes this while barely changing its area, and offset-based
+  grow/merge/shrink smoothing was tried and does not converge to a clean
+  shape here even at offsets far larger than the cluster itself.
 
-  # offset and boolean return PolygonSet, we only need the list of polygons from that
-  return mergedpolygonset.polygons 
+  Returns a list of point arrays (one per merged via shape).
+  """
+  above_shapely = [ShapelyPolygon(p) for p in above_polygons if len(p) >= 3]
+  below_shapely = [ShapelyPolygon(p) for p in below_polygons if len(p) >= 3]
+  if not above_shapely or not below_shapely or not via_polygons:
+    return []
+
+  above_rtree = _rtree_from_shapely_polygons(above_shapely)
+  below_rtree = _rtree_from_shapely_polygons(below_shapely)
+
+  # group vias by which (above-polygon, below-polygon) pair they land in
+  pair_vias = defaultdict(list)
+  for via_pts in via_polygons:
+    if len(via_pts) < 3:
+      continue
+    via_poly = ShapelyPolygon(via_pts)
+    if via_poly.area <= 0:
+      continue
+    above_i = _best_overlapping_polygon(via_poly, above_rtree, above_shapely)
+    below_i = _best_overlapping_polygon(via_poly, below_rtree, below_shapely)
+    if above_i is None or below_i is None:
+      continue  # via without metal on one side - drop it, matches old AND-based behavior
+    pair_vias[(above_i, below_i)].append(via_poly)
+
+  merged_points = []
+  for (above_i, below_i), vias in pair_vias.items():
+    via_extent = unary_union(vias).convex_hull
+
+    # simplify away the staircase jaggedness a hull can have around a
+    # non-rectangular (e.g. disk-shaped) via cluster; tolerance scales
+    # with the cluster's own size so a single/small via (already simple)
+    # is essentially untouched
+    minx, miny, maxx, maxy = via_extent.bounds
+    tolerance = min(maxx - minx, maxy - miny) * 0.02
+    if tolerance > 0:
+      via_extent = via_extent.simplify(tolerance, preserve_topology=True)
+
+    overlap = above_shapely[above_i].intersection(below_shapely[below_i]).intersection(via_extent)
+    if overlap.is_empty:
+      continue
+    parts = overlap.geoms if overlap.geom_type == 'MultiPolygon' else [overlap]
+    for part in parts:
+      if part.geom_type == 'Polygon' and part.area > 0:
+        merged_points.append(np.array(part.exterior.coords))
+  return merged_points
 
 
 def merge_polygons (polygons):
-  """Used internally to merge layer polygons 
+  """Used internally to merge layer polygons
 
   Args:
       polygons (_type_): LPPpolylist data
@@ -276,19 +428,73 @@ def merge_polygons (polygons):
   mergedpolygonset=gdspy.boolean(polygons, None,"or", max_points=999)
 
   # offset and boolean return PolygonSet, we only need the list of polygons from that
-  return mergedpolygonset.polygons 
+  return mergedpolygonset.polygons
 
 
+def merge_polygons_by_layer(cell):
+  """
+  Merge (boolean OR) all polygons within each (layer, datatype) group of a
+  flat cell into the minimal set of merged polygons. Reduces polygon count
+  where simplification has left many touching/overlapping shapes on the
+  same layer (e.g. adjacent solid fill squares) that no longer need to
+  stay separate. Only considers polygons directly in `cell` (depth=0),
+  which is fine here since by this point in the pipeline the cell is
+  already fully flattened.
+  """
+  new_lib = gdspy.GdsLibrary()
+  new_cell = gdspy.Cell(cell.name + "_merged_by_layer")
+
+  polys_by_layer = cell.get_polygons(by_spec=True, depth=0)
+  for (layer, datatype), polys in polys_by_layer.items():
+    if not polys:
+      continue
+    merged_points = merge_polygons(polys)
+    for pts in merged_points:
+      new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
+
+  new_lib.add(new_cell)
+  return new_lib
+
+
+def _merge_layers_in_place(cell, layers, datatype=0):
+    """
+    Merge (boolean OR) all polygons on each (layer, datatype) in `layers`
+    directly within `cell`, replacing them in place with the merged
+    result. No-op for a (layer, datatype) with 0 or 1 polygons.
+    """
+    polys_by_layer = cell.get_polygons(by_spec=True, depth=0)
+    for layer in layers:
+        polys = polys_by_layer.get((layer, datatype), [])
+        if len(polys) < 2:
+            continue
+        merged_points = merge_polygons(polys)
+        cell.remove_polygons(lambda pts, l, d, layer=layer: l == layer and d == datatype)
+        for pts in merged_points:
+            cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
 
 
 def merge_via_arrays_in_cell (input_cell, layers_list):
-      
+
     # create new library with new cell to hold polygons that are NOT removed
     new_lib = gdspy.GdsLibrary()
     new_cell = gdspy.Cell(input_cell.name+"_merged")
 
     # flatten hierarchy below this cell
     input_cell.flatten(single_layer=None, single_datatype=None, single_texttype=None)
+
+    # consolidate the metal layers used as via above/below references
+    # BEFORE via-array merging runs. A metal shape (e.g. a Metal5 plane
+    # under a pad) is very often drawn as many separate, merely-touching
+    # fragments (density-fill squares, array-instantiated pieces, etc.)
+    # that only become one continuous shape once merged. If via merging
+    # runs against those raw fragments instead, it matches individual
+    # vias to whichever specific fragment they happen to overlap and
+    # artificially splits what is really one connected via cluster into
+    # many separate, oddly-shaped output regions - producing exactly the
+    # jagged/fragmented via shapes this was supposed to avoid, even
+    # though the metal itself is smooth once merged.
+    via_metal_layers = set(layer_above_dict.values()) | set(layer_below_dict.values())
+    _merge_layers_in_place(input_cell, via_metal_layers)
 
     for layer_to_extract_gds in layers_list:
         # print ("Evaluating layer ", str(layer_to_extract_gds))
@@ -313,24 +519,18 @@ def merge_via_arrays_in_cell (input_cell, layers_list):
                     numpoly = len(layerpolygons)
                     print(f"Number of polygons on layer {layer}:{purpose}: {numpoly}")
 
-                    if layer in via_spacings_dict.keys():
-                        # merge via arrays, all other layers skip this step
-                        merge_polygon_size = via_spacings_dict.get(layer, 0)
-                        layerpolygons = merge_via_array (layerpolygons, merge_polygon_size)
+                    if layer in layer_above_dict:
+                        # via layer: replace the via array with clean solid
+                        # shapes covering wherever metal-above and
+                        # metal-below actually overlap around a real via
+                        layer_above_polygons = LPPpolylist.get((layer_above_dict[layer], 0), [])  # drawing
+                        layer_below_polygons = LPPpolylist.get((layer_below_dict[layer], 0), [])  # drawing
 
-                        # now get polygons on layer above and do boolean and with via
-                        layer_num_above = layer_above_dict[layer]
-                        layer_above_polygons = LPPpolylist[(layer_num_above, 0)] # drawing
-
-                        # Perform boolean AND with layer above
-                        layerpolygons = gdspy.boolean(layerpolygons, layer_above_polygons, operation='and', layer=layer, datatype=purpose)
-
-                        # now get polygons on layer below and do boolean and
-                        layer_num_below = layer_below_dict[layer]
-                        layer_below_polygons = LPPpolylist[(layer_num_below, 0)] # drawing
-                        layerpolygons = gdspy.boolean(layerpolygons, layer_below_polygons, operation='and', layer=layer, datatype=purpose)
-                        
-                        new_cell.add(layerpolygons)
+                        merged_points = merge_via_array_by_metal_overlap(
+                            layerpolygons, layer_above_polygons, layer_below_polygons
+                        )
+                        for pts in merged_points:
+                            new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=purpose))
 
                     else:
                         # merge polygon layer polygons
@@ -347,11 +547,11 @@ def merge_via_arrays_in_cell (input_cell, layers_list):
 # Helper functions for cutout removal
 # ----------------------------------------------
 
-def remove_cutout_keep_hierarchy (library, layers_list):
+def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None):
   # iterate over cells
   for cell in library:
     # print('cellname = ' + str(cell.name))
-  
+
     # iterate over polygons
     for n,poly in enumerate(cell.polygons):
       # points of this polygon
@@ -361,64 +561,34 @@ def remove_cutout_keep_hierarchy (library, layers_list):
       poly_purpose = poly.datatypes[0]
 
 
-      # -------- Check for dummy rectagles with hole inside ---------
+      # -------- Check for polygons with holes (dummy fill with cutout, or thin rings) ---------
       if (poly_layer in layers_list):
         # Polygon of interest, check if we need to process this
 
-        # get number of vertices
-        numvertices = len(polypoints)
+        decomp = decompose_polygon_holes(polypoints)
+        if decomp is not None:
+          is_thin_ring = (
+            decomp["hole_area_fraction"] >= RING_HOLE_FRACTION_THRESHOLD
+            and design_bbox is not None
+            and is_ring_candidate(poly.get_bounding_box(), design_bbox)
+          )
 
-        # criteria for dummy rectangle with cutout:
-        # number of vertices = 10 
-        # when sorting vertices by distance to center, we have 4 identcal values for outer distance and 4 identical values for inner distance
-
-
-        # we are interested in polygons with 10 vertices
-        if numvertices == 10:
-          # get bounding box
-          bb = poly.get_bounding_box()
-
-          xmin = bb[0,0]
-          ymin = bb[0,1]
-          xmax = bb[1,0]
-          ymax = bb[1,1]
-
-          xcenter = (xmax+xmin)/2
-          ycenter = (ymax+ymin)/2
-
-          # print('      Bounding box xmin=', xmin, ' ymin=', ymin,' xmax=', xmax, ' ymax=', ymax)
-
-          radius_list = []
-          for i_vertex in range(numvertices):
-            
-            # print('polypoints  = ' + str(polypoints))
-            x = polypoints[i_vertex][0]
-            y = polypoints[i_vertex][1]
-
-            # calculate distance from center
-            r = math.sqrt((x-xcenter)**2 + (y-ycenter)**2)
-            radius_list.append(r)
-
-          # get count for radius values
-          counter = Counter(radius_list)
-          sorted_by_count = sorted(counter.items(), key=lambda x: x[1], reverse=True)
-          
-          r1,n1 = sorted_by_count[0]   
-          r2,n2 = sorted_by_count[1]   
-
-          if n1==4 and n2==4:
-            # We can be sure we have a dummy square with cutout.
-            print(cell.name, ' replacing cutout polygon #', str(n), 'layer', str(poly_layer))      
+          if is_thin_ring:
+            print(cell.name, ' deleting periphery ring polygon #', str(n), 'layer', str(poly_layer))
+            poly.layers=[0]
+            cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
+          else:
+            # We can be sure we have a dummy shape with cutout.
+            print(cell.name, ' replacing cutout polygon #', str(n), 'layer', str(poly_layer))
 
             # invalidate original polygon
             poly.layers=[0]
             # remove original polygon
             cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
 
-            # Replace it with a solid square   
-            basepoly_points=[(xmin,ymin),(xmin,ymax),(xmax,ymax),(xmax,ymin),(xmin,ymin)]    
-            basepoly = gdspy.Polygon(basepoly_points, layer=poly_layer, datatype=poly_purpose)
-            cell.add(basepoly)     
+            # Replace it with a solid version of the exterior outline
+            basepoly = gdspy.Polygon(decomp["exterior_coords"], layer=poly_layer, datatype=poly_purpose)
+            cell.add(basepoly)
   return library
 
 
@@ -462,129 +632,137 @@ def replace_circles (library, layers_list, min_size=0):
   return library
 
 
-
-def is_circle_like(points, radius_variation_threshold=0.2, min_points=12):
-    """
-    Detects whether a polygon is circle-like using:
-    - Enough points
-    - Uniform radii from centroid
-    """
-    pts = np.asarray(points)
-
-    # Must have enough vertices
-    if len(pts) < min_points:
-        return False
-
-    # Compute centroid
-    center = pts.mean(axis=0)
-    
-    # Compute radii
-    radii = np.linalg.norm(pts - center, axis=1)
-
-    # Radii uniformity (coefficient of variation)
-    cv = radii.std() / radii.mean()
-
-    if cv < radius_variation_threshold:
-      # Compute distances between consecutive points
-      edge_lengths = np.sqrt(np.sum(np.diff(np.vstack([pts, pts[0]]), axis=0)**2, axis=1))
-      avg_edge = np.average(edge_lengths)
-      max_edge = np.max(edge_lengths)    
-      # print(f'edgelength avg {avg_edge} max {max_edge} factor {max_edge/avg_edge}')
-      # Check if any edge length differs by more than factor 2
-      if (max_edge > 10 * avg_edge) or max_edge > 100:
-          return False    
-
-    return cv < radius_variation_threshold
-
-
-
-def simplify_round_polygon_to_octagon(points, min_size=0):
-    pts = np.asarray(points)
-
-    # --- 1. Estimate circle center ---
-    center = pts.mean(axis=0)
-
-    # --- 2. Estimate radius ---
-    radii = np.linalg.norm(pts - center, axis=1)
-    radius = radii.mean()
-
-    # skip if radius below limit
-    if radius < min_size/2:
-       return pts
-
-    # --- 3. Fixed angles (rotated by 22.5°) ---
-    angles = np.deg2rad(np.arange(0, 360, 45) + 22.5)  # 0,45,90,.. +22.5
-
-    # --- 4. Generate octagon points ---
-    octagon = np.column_stack([
-        center[0] + radius * np.cos(angles),
-        center[1] + radius * np.sin(angles)
-    ])
-
-    return octagon
-
-
 # --------------------------
 #   main
 # --------------------------
 
 
-if len(sys.argv) >= 2:
-    input_name = sys.argv[1]
-    
-    # output file specified?
-    if len(sys.argv) == 3:
-        output_name = sys.argv[2]
-    else:
-        output_name = input_name.replace('.gds','_cleaned.gds')
-    
+def print_run_config(parser, args):
+    """Print the full set of available commandline options and how to use
+    them, followed by the value actually used for each on this run - so a
+    user never has to guess what a run did after the fact."""
+    print(parser.format_help())
+    print("Resolved configuration for this run:")
+    for name, value in sorted(vars(args).items()):
+        print(f"  {name} = {value}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Prepare IHP SG13G2 GDSII layout for EM simulation.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("input_gds", help="input GDSII file")
+    parser.add_argument("output_gds", nargs="?", help="output GDSII file (default: <input>_cleaned.gds)")
+    parser.add_argument("--fill-minsize", type=float, default=1,
+                         help="minimum polygon bbox size (microns) to consider for floating-fill removal (default: 1)")
+    parser.add_argument("--fill-maxsize", type=float, default=None,
+                         help="maximum polygon bbox size (microns) to consider for floating-fill removal "
+                              "(default: no limit - a same-size group is judged by how often it repeats "
+                              "instead, see --fill-mincount)")
+    parser.add_argument("--fill-mincount", type=int, default=20,
+                         help="minimum number of same-size isolated polygons on a layer before they're "
+                              "treated as removable fill (default: 20)")
+    args = parser.parse_args()
+    print_run_config(parser, args)
+
+    input_name = args.input_gds
+    output_name = args.output_gds if args.output_gds else input_name.replace('.gds', '_cleaned.gds')
+
     print ("Input file: ", input_name)
 
-    lib = gdspy.GdsLibrary()
-    lib.read_gds(input_name)
+    # Intermediate GDS files between steps are written into a temporary
+    # directory (auto-deleted when this block exits, including on error)
+    # rather than the working directory - only the final output file is
+    # left behind. Round-tripping through GDS between steps (instead of
+    # passing library/cell objects directly in memory) is required here:
+    # gdspy's flatten()/get_polygonsets() hits an internal bug on some
+    # in-memory-only reference structures ('tuple' object does not
+    # support item assignment) that only the GDS write+read cycle avoids.
+    with tempfile.TemporaryDirectory(prefix="gds_prepare_for_EM_") as tmp_dir:
+        def tmp_path(name):
+            return os.path.join(tmp_dir, name)
 
-    # STEP 1: remove cutouts in the hierachical design, don't flatten at this stage
-    # do this on metal layers (not via layers, not EM port layers)
-    print(f"\nSTEP 1: remove cutouts in the hierachical design, don't flatten at this stage")
-    lib = remove_cutout_keep_hierarchy (lib, metal_layers_list)
-    lib.write_gds('tmp.gds')
+        lib = gdspy.GdsLibrary()
+        lib.read_gds(input_name)
 
-    # define layers for processing
-    layers_list = metal_layers_list
-    layers_list.extend(via_layers_list)
-    # in addition to IHP layers, also keep layers above 200 that we use for ports etc.
-    for layer in range(201,250):
-        layers_list.append(layer)
+        top_cells = lib.top_level()
+        top_cell_name = top_cells[0].name if top_cells else None
+        design_bbox = top_cells[0].get_bounding_box() if top_cells else None
 
-    # STEP 2: via array merging, this also flattens the design hierarchy
-    # Read GDSII library
-    print(f'\nSTEP 2: via array merging, this also flattens the design hierarchy')
-    tmp_library = gdspy.GdsLibrary(infile='tmp.gds')
-    top = tmp_library.top_level()[0]
-    merged_lib = merge_via_arrays_in_cell (top, layers_list)
-    merged_lib.write_gds('merged.gds')
+        # STEP 1: remove cutouts in the hierachical design, don't flatten at this stage
+        # do this on metal layers (not via layers, not EM port layers)
+        print(f"\nSTEP 1: remove cutouts in the hierachical design, don't flatten at this stage")
+        lib = remove_cutout_keep_hierarchy (lib, metal_layers_list, design_bbox=design_bbox)
 
-    # STEP 3: remove floating metals that are not connected to anything, with size in a range
-    minsize=1
-    maxsize=40
-    print(f'\nSTEP 3: remove floating metals that are not connected to anything, with size in a range {minsize}..{maxsize}')
-    tmp2_library = gdspy.GdsLibrary(infile='merged.gds')
-    merged_top = tmp2_library.top_level()[0]
-    nofloat_lib = find_isolated_same_size_polygons_by_layer(merged_top, metal_layers_list, minsize=minsize, maxsize=maxsize, mincount=20)
-    nofloat_lib.write_gds('cleaned.gds')
-    
-    # STEP 4: replace circle-like polygons by octagons
-    minsize=10
-    print(f'\nSTEP 4: replace circle-like polygons by octagons if diameter > {minsize}')
-    tmp3_library = gdspy.GdsLibrary(infile='cleaned.gds')
-    convert_lib = replace_circles (tmp3_library, metal_layers_list, min_size=10)
-    convert_lib.write_gds('converted.gds')
+        # STEP 2: detect and delete thin ring/frame structures on the periphery
+        # (e.g. seal rings). This has to run before via array merging, since it
+        # needs the design hierarchy intact (a seal ring is typically built
+        # from several segment cells, not one polygon-with-hole).
+        print(f"\nSTEP 2: detect periphery ring/frame structures (e.g. seal rings)")
+        if top_cell_name is not None:
+            detect_and_delete_periphery_rings(lib, top_cell_name, apply=True)
+        lib.write_gds(tmp_path('tmp.gds'))
 
-    # SAVE RESULTS
-    convert_lib.write_gds(output_name)
+        # define layers for processing
+        layers_list = metal_layers_list
+        layers_list.extend(via_layers_list)
+        # in addition to IHP layers, also keep layers above 200 that we use for ports etc.
+        for layer in range(201,250):
+            layers_list.append(layer)
+
+        # STEP 3: via array merging, this also flattens the design hierarchy
+        print(f'\nSTEP 3: via array merging, this also flattens the design hierarchy')
+        tmp_library = gdspy.GdsLibrary(infile=tmp_path('tmp.gds'))
+        top = tmp_library.top_level()[0]
+        merged_lib = merge_via_arrays_in_cell (top, layers_list)
+        merged_lib.write_gds(tmp_path('merged.gds'))
+
+        # STEP 4: replace circle-like polygons by octagons. This has to run
+        # before per-layer merging (STEP 5): a round pad that is electrically
+        # connected to a trace is still its own separate polygon at this point,
+        # so its shape reads as circular. If circle detection ran after STEP 5
+        # instead, a connected round pad would already be fused with its trace
+        # into one non-circular "lollipop" polygon, and circularity detection
+        # would (correctly, for that fused shape) no longer recognize it as a
+        # circle - so genuinely round, but connected, pads would silently never
+        # get simplified. Floating round pads aren't affected either way, but
+        # connected ones only stay detectable if this runs first.
+        minsize=10
+        print(f'\nSTEP 4: replace circle-like polygons by octagons if diameter > {minsize}')
+        convert_lib = replace_circles (merged_lib, metal_layers_list, min_size=minsize)
+        convert_lib.write_gds(tmp_path('converted.gds'))
+
+        # STEP 5: merge (boolean OR) polygons within each layer/datatype. This has
+        # to run before floating-fill removal (STEP 6): the isolation test there
+        # only asks "does this polygon touch anything at all", so two touching
+        # copies of the same dummy-fill unit and two touching segments of real
+        # connected metal look identical to it unless touching neighbors have
+        # already been fused into one shape first. Merging here turns a floating
+        # cluster of fill units into its own small isolated polygon, while real
+        # connected metal (including the octagons from STEP 4, if they touch a
+        # trace) merges into one (or a few) large, usually unique shape.
+        print('\nSTEP 5: merge polygons per layer')
+        convert_top = gdspy.GdsLibrary(infile=tmp_path('converted.gds')).top_level()[0]
+        merged_by_layer_lib = merge_polygons_by_layer(convert_top)
+        merged_by_layer_lib.write_gds(tmp_path('merged_by_layer.gds'))
+
+        # STEP 6: remove floating metals that are not connected to anything, if a
+        # same size repeats at least --fill-mincount times on a layer. Nothing
+        # after this point introduces new touching geometry (removal only
+        # removes), so STEP 5's merge is already final - no need to merge again.
+        minsize = args.fill_minsize
+        maxsize = args.fill_maxsize
+        mincount = args.fill_mincount
+        size_desc = f'{minsize}..{maxsize}' if maxsize is not None else f'>= {minsize} (no upper limit)'
+        print(f'\nSTEP 6: remove floating metals that are not connected to anything, size {size_desc}, repeating >= {mincount} times per size')
+        premerged_top = gdspy.GdsLibrary(infile=tmp_path('merged_by_layer.gds')).top_level()[0]
+        nofloat_lib = find_isolated_same_size_polygons_by_layer(premerged_top, metal_layers_list, minsize=minsize, maxsize=maxsize, mincount=mincount)
+
+        # SAVE RESULTS - the only GDS file left behind after this function returns
+        nofloat_lib.write_gds(output_name)
+
     print("Created final output file",output_name)
 
 
-else:
-  print ("Usage: gds_prepare_for_EM <input.gds> [output.gds]")
-  
+if __name__ == "__main__":
+    main()
