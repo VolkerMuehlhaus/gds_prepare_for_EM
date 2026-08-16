@@ -1,3 +1,25 @@
+# Prepare IHP SG13G2 GDSII layout for EM simulation: an all-in-one pipeline
+# combining cutout removal, periphery ring/frame deletion, via-array
+# simplification, round-pad-to-octagon conversion, and floating-fill removal.
+
+########################################################################
+#
+# Copyright 2025 Volker Muehlhaus and IHP PDK Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+########################################################################
+
 import argparse
 import os
 import tempfile
@@ -15,6 +37,8 @@ from gds_geometry_utils import (
     is_ring_candidate,
     detect_and_delete_periphery_rings,
 )
+
+__version__ = "1.0"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
@@ -626,6 +650,7 @@ def print_run_config(parser, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare IHP SG13G2 GDSII layout for EM simulation.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("input_gds", help="input GDSII file")
     parser.add_argument("output_gds", nargs="?", help="output GDSII file (default: <input>_cleaned.gds)")
     parser.add_argument("--fill-minsize", type=float, default=1,

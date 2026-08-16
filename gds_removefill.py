@@ -1,11 +1,31 @@
-# Simplify layouts in IHP SG13G2 technology for EM: 
+# Simplify layouts in IHP SG13G2 technology for EM:
 # remove unconnected dummy metal fill from drawing purpose (data type 0)
+
+########################################################################
+#
+# Copyright 2025 Volker Muehlhaus and IHP PDK Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+########################################################################
 
 import argparse
 import gdspy
 from collections import defaultdict
 from rtree import index  # pip install rtree
 import numpy as np
+
+__version__ = "1.0"
 
 
 # Layer number <-> name mapping. To adapt this tool to a different
@@ -239,6 +259,7 @@ def print_run_config(parser, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Remove unconnected dummy metal fill from IHP SG13G2 GDSII layout.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("input_gds", help="input GDSII file")
     parser.add_argument("output_gds", nargs="?", help="output GDSII file (default: <input>_cleaned.gds)")
     parser.add_argument("--minsize", type=float, default=1,

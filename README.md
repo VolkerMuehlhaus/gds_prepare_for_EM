@@ -56,21 +56,34 @@ Starting from the example above, the resulting cleaned and simplified GDSII then
 [<img src="./doc/png/cleaned_gds.png" width="800" />](cleaned gds)
 
 
-# Usage
-To run a tool, specify the *.gds filename as commandline parameter; the cleaned file is saved with an appropriate file suffix (or pass a second argument to choose the output filename). Every tool always prints its full list of options and the values used for that particular run, so you can see exactly what a run did after the fact - run with `--help` to see the options without processing a file.
+# Installation
 
-example:
+There are two ways to use these tools - pick whichever fits your workflow.
+
+**Run the Python files directly**, no installation needed beyond the dependencies:
+```
+pip install -r requirements.txt
+python gds_prepare_for_EM.py layout.gds
+```
+
+**Install as a package**, which adds `gds_prepare_for_EM`, `gds_simplify`, and `gds_removefill` as commands on your PATH while the virtual environment is active:
+```
+pip install gds_prepare_for_EM
+gds_prepare_for_EM layout.gds
+```
+(For a local/development install from a clone of this repository, use `pip install -e .` instead.)
+
+# Usage
+To run a tool, specify the *.gds filename as commandline parameter; the cleaned file is saved with an appropriate file suffix (or pass a second argument to choose the output filename). Every tool always prints its full list of options and the values used for that particular run, so you can see exactly what a run did after the fact - run with `--help` to see the options without processing a file, or `--version` to print the version.
+
+example, either as a direct script or as an installed command:
 ```
 python gds_prepare_for_EM.py layout.gds
 python gds_prepare_for_EM.py layout.gds cleaned_layout.gds
-```
 
-# Prerequisites
-The code requires Python3 and these libraries, install using pip install libraryname (or `pip install -r requirements.txt`)
-- gdspy
-- rtree
-- numpy
-- shapely (>=2.0)
+gds_prepare_for_EM layout.gds
+gds_prepare_for_EM layout.gds cleaned_layout.gds
+```
 
 
 

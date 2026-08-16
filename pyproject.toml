@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gds_prepare_for_EM"
+version = "1.0"
+description = "Simplify IHP SG13G2 GDSII layouts for EM simulation (Palace, openEMS)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Volker Muehlhaus" },
+]
+keywords = ["gdsii", "gds", "ihp", "sg13g2", "em-simulation", "openems", "palace", "eda"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = [
+    "gdspy",
+    "rtree",
+    "numpy",
+    "shapely>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/VolkerMuehlhaus/gds_prepare_for_EM"
+Repository = "https://github.com/VolkerMuehlhaus/gds_prepare_for_EM"
+
+[project.scripts]
+gds_prepare_for_EM = "gds_prepare_for_EM:main"
+gds_simplify = "gds_simplify:main"
+gds_removefill = "gds_removefill:main"
+
+[tool.setuptools]
+py-modules = ["gds_prepare_for_EM", "gds_simplify", "gds_removefill", "gds_geometry_utils"]

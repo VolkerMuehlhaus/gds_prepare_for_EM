@@ -15,11 +15,11 @@
 #
 # Copyright 2025 Volker Muehlhaus and IHP PDK Authors
 #
-# Licensed under the GNU General Public License, Version 3.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    https://www.gnu.org/licenses/gpl-3.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -41,6 +41,8 @@ from gds_geometry_utils import (
     is_ring_candidate,
     detect_and_delete_periphery_rings,
 )
+
+__version__ = "1.0"
 
 
 # ==================== settings =========================
@@ -123,6 +125,7 @@ def print_run_config(parser, args):
 
 def main():
   parser = argparse.ArgumentParser(description="Simplify IHP SG13G2 GDSII layout for EM simulation.")
+  parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
   parser.add_argument("input_gds", help="input GDSII file")
   parser.add_argument("--exclude-layers", help="comma-separated layer numbers to exclude from the built-in default set")
   args = parser.parse_args()
