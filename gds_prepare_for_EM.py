@@ -102,10 +102,10 @@ via_layers_list = [NAME_TO_LAYER[name] for name in list(VIA_ABOVE_BELOW) + EXTRA
 
 # layers in this purpose list are EXCLUDED from output file
 exclude_purpose_list = [
-  20, # noqrc
+  28, # noqrc
   22, # filler
   23, # nofill
-  32 # block
+  21  # block
 ]
 
 # Layers above the via layer
