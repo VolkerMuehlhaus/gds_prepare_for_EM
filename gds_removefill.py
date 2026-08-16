@@ -1,26 +1,36 @@
 # Simplify layouts in IHP SG13G2 technology for EM: 
 # remove unconnected dummy metal fill from drawing purpose (data type 0)
 
+import argparse
 import gdspy
-import sys
 from collections import defaultdict
 from rtree import index  # pip install rtree
 import numpy as np
 
 
-# Via layers to be
-via_layers_list = [
-  6,  # Cont
-  19, # Via1
-  29, # Via2
-  49, # Via3
-  66, # Via4 
-  129,# Vmim
-  125,# TopVia1
-  133, # TopVia2
-  41, # dfpad:pillar
-  9  # Passiv
+# Layer number <-> name mapping. To adapt this tool to a different
+# PDK/layer stack, edit this table - via_layers_list below derives from it
+# automatically.
+LAYER_NAMES = {
+  6: "Cont",
+  9: "Passiv",
+  19: "Via1",
+  29: "Via2",
+  41: "Pillar",
+  49: "Via3",
+  66: "Via4",
+  125: "TopVia1",
+  129: "Vmim",
+  133: "TopVia2",
+}
+NAME_TO_LAYER = {name: layer for layer, name in LAYER_NAMES.items()}
+
+# Via (and via-like) layers to be excluded from floating polygon removal
+VIA_LAYER_NAMES = [
+  "Cont", "Via1", "Via2", "Via3", "Via4", "Vmim", "TopVia1", "TopVia2",
+  "Pillar", "Passiv",
 ]
+via_layers_list = [NAME_TO_LAYER[name] for name in VIA_LAYER_NAMES]
 
 
 # --------------------------
@@ -39,16 +49,23 @@ def bbox_size(poly, tol=1e-6):
     h = round((ymax - ymin) / tol) * tol
     return (w, h)
 
-def touches_any(poly, rtree_idx, all_polys, minsize, maxsize, precision=1e-5):
+def touches_any(poly, rtree_idx, all_polys, precision=1e-5):
     """
     Return True if poly touches or intersects any other polygon in all_polys.
-    Return false if polygon size < minsize or > maxsize
+
+    Any touching neighbor counts as a real connection, including a
+    same-size one: identical-size polygons that touch each other must not
+    be treated as fill and deleted, since real connected metal is often
+    built from many touching copies of the same unit tile too, same as
+    dummy fill is. To correctly tell a genuinely floating cluster of
+    touching same-size fill units apart from real connected metal made of
+    the same-size tiles, run merge_polygons_by_layer() on the cell
+    *before* calling find_isolated_same_size_polygons_by_layer(): merging
+    fuses each connected cluster into a single polygon first, so the
+    isolation test here only ever has to ask "does this (already-merged)
+    shape touch anything else" - which is unambiguous.
     """
     (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
-    
-    size = max(xmax-xmin, ymax-ymin)
-    if size<minsize or size>maxsize:
-        return True # don't check these, treat as not isolated
 
     candidate_ids = list(rtree_idx.intersection((xmin, ymin, xmax, ymax)))
 
@@ -64,18 +81,58 @@ def touches_any(poly, rtree_idx, all_polys, minsize, maxsize, precision=1e-5):
     return False  # isolated
 
 
-def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, maxsize=40, size_tol=1e-6 ):
+def merge_polygons(polygons):
+    """Merge (boolean OR) a list of LPPpolylist-style polygons, return the merged point-arrays."""
+    mergedpolygonset = gdspy.boolean(polygons, None, "or", max_points=999)
+    return mergedpolygonset.polygons
+
+
+def merge_polygons_by_layer(cell):
     """
-    Flatten the hierarchy and return:
-        {layer: {size: [isolated polygons]}}
+    Merge (boolean OR) all polygons within each (layer, datatype) group of
+    a flat cell into the minimal set of merged polygons. Must run before
+    find_isolated_same_size_polygons_by_layer(), see touches_any() for why.
+    """
+    new_lib = gdspy.GdsLibrary()
+    new_cell = gdspy.Cell(cell.name + "_merged_by_layer")
+
+    polys_by_layer = cell.get_polygons(by_spec=True, depth=0)
+    for (layer, datatype), polys in polys_by_layer.items():
+        if not polys:
+            continue
+        merged_points = merge_polygons(polys)
+        for pts in merged_points:
+            new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
+
+    new_lib.add(new_cell)
+    return new_lib
+
+
+def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, maxsize=None, mincount=20, size_tol=1e-6 ):
+    """
+    Flatten the hierarchy and remove isolated (floating) polygons that
+    repeat with the same bounding-box size at least `mincount` times on a
+    layer - this is the signature of auto-generated or man-made dummy
+    metal fill. A same-size group with fewer than `mincount` members is
+    left untouched even if isolated, since it's more likely to be
+    deliberate design content than repetitive fill.
+
+    IMPORTANT: run merge_polygons_by_layer() on `cell` before calling
+    this - see touches_any() for why.
+
+    Gating on repeat count (rather than a fixed absolute size ceiling)
+    generalizes across layers/layouts automatically: a size that
+    legitimately repeats often enough is treated as fill regardless of
+    its absolute micron size, and groups below mincount are skipped
+    before running the (relatively expensive) isolation test at all.
+    `maxsize` remains available as an optional manual cap; leave it as
+    None to rely on mincount alone (the default).
+
     Only considers polygons on the same layer for isolation.
     """
-    print(f"Removing floating metal with size {minsize} between and {maxsize} units, excluding via layers")
-
-
     # create new library with new cell to hold polygons that are NOT removed
     new_lib = gdspy.GdsLibrary()
-    new_cell = gdspy.Cell(cell.name)
+    new_cell = gdspy.Cell(cell.name + "_cleaned")
 
     # Flatten hierarchy
     flat = cell.flatten()
@@ -107,34 +164,44 @@ def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, 
         # only check if not via layer
         if layer not in via_layers_list:
 
-            # Compute sizes
-            size_data = []
-            for poly in all_polys:
-                size = bbox_size(poly, tol=size_tol)
-                size_data.append((poly, size))
-
-            # Group by size
             groups = defaultdict(list)
-            for poly, size in size_data:
-                groups[size].append(poly)
+            for poly in all_polys:
+                groups[bbox_size(poly, tol=size_tol)].append(poly)
 
-            # Build R-tree for the layer
+            # Build R-tree for the whole layer once, used by any size group
+            # that passes the cheap pre-filters below
             rtree_idx = index.Index()
             for i, poly in enumerate(all_polys):
                 (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
                 rtree_idx.insert(i, (xmin, ymin, xmax, ymax))
 
-            # Filter isolated polygons
             isolated = {}
             for size, polys in groups.items():
+                w, h = size
+
+                # cheap pre-filters, avoid the isolation test entirely when
+                # the group can't possibly qualify for removal
+                below_mincount = len(polys) < mincount
+                below_minsize = w < minsize or h < minsize
+                above_maxsize = maxsize is not None and (w > maxsize or h > maxsize)
+                if below_mincount or below_minsize or above_maxsize:
+                    for poly in polys:
+                        new_cell.add(poly)
+                    continue
+
                 keep = []
                 for poly in polys:
-                    if touches_any(poly, rtree_idx, all_polys, minsize=minsize, maxsize=maxsize):
+                    if touches_any(poly, rtree_idx, all_polys, precision=1e-5):
                         new_cell.add(poly)
-                    else:    
+                    else:
                         keep.append(poly)
-                if keep:
+
+                if len(keep) >= mincount:
                     isolated[size] = keep
+                else:
+                    # not enough of them actually turned out isolated - keep them all
+                    for poly in keep:
+                        new_cell.add(poly)
 
             if isolated:
                 isolated_per_layer[layer] = isolated
@@ -146,7 +213,7 @@ def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, 
     for layer, layer_data in isolated_per_layer.items():
         print(f"Layer {layer}:")
         for size, polys in layer_data.items():
-            print(f"  Size {size}: {len(polys)} isolated polygons")
+            print(f"  Size {size}: removed {len(polys)} isolated polygons")
 
     new_lib.add(new_cell)
     return new_lib
@@ -159,27 +226,55 @@ def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, 
 # --------------------------
 
 
+def print_run_config(parser, args):
+    """Print the full set of available commandline options and how to use
+    them, followed by the value actually used for each on this run - so a
+    user never has to guess what a run did after the fact."""
+    print(parser.format_help())
+    print("Resolved configuration for this run:")
+    for name, value in sorted(vars(args).items()):
+        print(f"  {name} = {value}")
+    print()
 
-if len(sys.argv) >= 2:
-    input_name = sys.argv[1]
-    
-    # output file specified?
-    if len(sys.argv) == 3:
-        output_name = sys.argv[2]
-    else:
-        output_name = input_name.replace('.gds','_cleaned.gds')
-    
+
+def main():
+    parser = argparse.ArgumentParser(description="Remove unconnected dummy metal fill from IHP SG13G2 GDSII layout.")
+    parser.add_argument("input_gds", help="input GDSII file")
+    parser.add_argument("output_gds", nargs="?", help="output GDSII file (default: <input>_cleaned.gds)")
+    parser.add_argument("--minsize", type=float, default=1,
+                         help="minimum polygon bbox size (microns) to consider for floating-fill removal (default: 1)")
+    parser.add_argument("--maxsize", type=float, default=None,
+                         help="maximum polygon bbox size (microns) to consider for floating-fill removal "
+                              "(default: no limit - a same-size group is judged by how often it repeats "
+                              "instead, see --mincount)")
+    parser.add_argument("--mincount", type=int, default=20,
+                         help="minimum number of same-size isolated polygons on a layer before they're "
+                              "treated as removable fill (default: 20)")
+    args = parser.parse_args()
+    print_run_config(parser, args)
+
+    input_name = args.input_gds
+    output_name = args.output_gds if args.output_gds else input_name.replace('.gds', '_cleaned.gds')
+
     print ("Input file: ", input_name)
 
     lib = gdspy.GdsLibrary()
-
     lib.read_gds(input_name)
     top = lib.top_level()[0]
+    top.flatten()
 
-    new_lib = find_isolated_same_size_polygons_by_layer(top, via_layers_list, minsize=1, maxsize=40)
+    # merge touching same-layer polygons first - see touches_any() for why
+    # this has to happen before the isolation test
+    merged_lib = merge_polygons_by_layer(top)
+    merged_top = merged_lib.top_level()[0]
+
+    new_lib = find_isolated_same_size_polygons_by_layer(
+        merged_top, via_layers_list, minsize=args.minsize, maxsize=args.maxsize, mincount=args.mincount
+    )
     new_lib.write_gds(output_name)
 
+    print('\n\nFINISHED: Created output file ', output_name)
 
-else:
-  print ("Usage: gds_removefill <input.gds> [output.gds]")
-  
+
+if __name__ == "__main__":
+    main()
