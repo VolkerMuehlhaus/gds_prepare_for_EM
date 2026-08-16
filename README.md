@@ -1,5 +1,11 @@
 # Prepare IHP SG13G2 GDSII layout for EM simulation
 
+---
+
+**Version 1.0: all-new, geometry-based algorithms across every tool, replacing the earlier hardcoded heuristics — for significantly cleaner and more general simplification output.**
+
+---
+
 This is a collection of tools to simplify GDSII layout for EM simulation.
 
 Layouts are usually simple and clean in the initial design phase, but simulating  a „final“ layout that was already prepared for tape-out with density rules etc. can be a challenge.
