@@ -18,7 +18,11 @@ To solve these issues and create a more simulation-friendly layout, a collection
 ## gds_removefill
 Removes unconnected (floating) man-made dummy metal fill. A shape only counts as removable fill once that same size repeats often enough on a layer, so genuinely isolated design content is left alone.
 
-Options: `--mincount N` how many repeats of the same size count as fill (default 20) · `--minsize`/`--maxsize` optional manual size bounds (default: no upper limit) · optional output filename as second argument.
+Optional commandline parameters, and their default value if not given:
+- `output filename` (second positional argument) - `<input>_cleaned.gds`
+- `--minsize` - `1` (micron)
+- `--maxsize` - no upper limit
+- `--mincount` - `20` (how many repeats of the same size count as fill)
 
 ```
 python gds_removefill.py layout.gds cleaned_layout.gds --minsize 1 --maxsize 40 --mincount 20
@@ -27,7 +31,8 @@ python gds_removefill.py layout.gds cleaned_layout.gds --minsize 1 --maxsize 40 
 ## gds_simplify
 Replaces density-fill cutouts (squares/shapes with a hole punched in them) with solid outlines, replaces circle-like pads with octagons for faster meshing, and detects and removes thin ring/frame structures on the layout periphery such as seal rings. Always processes the full built-in default set of layers.
 
-Options: `--exclude-layers L1,L2,...` skip specific layers from that default set.
+Optional commandline parameters, and their default value if not given:
+- `--exclude-layers` - none (the full built-in default layer set is processed)
 
 ```
 python gds_simplify.py layout.gds --exclude-layers 126,134
@@ -36,7 +41,11 @@ python gds_simplify.py layout.gds --exclude-layers 126,134
 ## gds_prepare_for_EM
 The all-in-one tool: runs all of the above plus via-array simplification (replacing dense via arrays with a handful of clean shapes) and round-pad-to-octagon conversion, producing a single simulation-ready output file in one pass.
 
-Options: `--fill-mincount`/`--fill-minsize`/`--fill-maxsize` same meaning as in gds_removefill · optional output filename as second argument.
+Optional commandline parameters, and their default value if not given:
+- `output filename` (second positional argument) - `<input>_cleaned.gds`
+- `--fill-minsize` - `1` (micron)
+- `--fill-maxsize` - no upper limit
+- `--fill-mincount` - `20` (how many repeats of the same size count as fill)
 
 ```
 python gds_prepare_for_EM.py layout.gds cleaned_layout.gds --fill-minsize 1 --fill-maxsize 40 --fill-mincount 20
