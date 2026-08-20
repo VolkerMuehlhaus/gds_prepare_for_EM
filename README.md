@@ -11,7 +11,7 @@ This is a collection of tools to simplify GDSII layout for EM simulation.
 Layouts are usually simple and clean in the initial design phase, but simulating  a „final“ layout that was already prepared for tape-out with density rules etc. can be a challenge.
 The picture below shows some typical challenges:
 
-[<img src="./doc/png/inital_gds.png" width="800" />](initial gds)
+<img src="./doc/png/inital_gds.png" width="800" />
 
 1) To fulfill metal density rules, larger areas have been created as an array of squares with hole inside. This hole does not really matter for EM results, but it will lead to additional mesh cells and slow down mesh generation and simulation.
 For openEMS, the value of refined_cellsize can efficiently be used to skip small detail, but still those edges will slow down the meshing processing. For Palace, such small detail will all be included in mesh and it is absolutely required to remove this.
@@ -59,12 +59,14 @@ python gds_prepare_for_EM.py layout.gds cleaned_layout.gds --fill-minsize 1 --fi
 
 Starting from the example above, the resulting cleaned and simplified GDSII then looks like this:
 
-[<img src="./doc/png/cleaned_gds.png" width="800" />](cleaned gds)
+<img src="./doc/png/cleaned_gds.png" width="800" />
 
 
 # Installation
 
 There are two ways to use these tools - pick whichever fits your workflow.
+
+Requires Python 3.9+ and these libraries: `gdspy`, `rtree`, `numpy`, `shapely` (>=2.0).
 
 **Run the Python files directly**, no installation needed beyond the dependencies:
 ```
