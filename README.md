@@ -93,5 +93,6 @@ gds_prepare_for_EM layout.gds
 gds_prepare_for_EM layout.gds cleaned_layout.gds
 ```
 
+# License
 
-
+This project is licensed under the Apache License, Version 2.0 - see [LICENSE](./LICENSE) for the full text.
