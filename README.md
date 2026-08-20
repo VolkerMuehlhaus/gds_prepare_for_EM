@@ -66,6 +66,8 @@ Starting from the example above, the resulting cleaned and simplified GDSII then
 
 There are two ways to use these tools - pick whichever fits your workflow.
 
+Requires Python 3.9+ and these libraries: `gdspy`, `rtree`, `numpy`, `shapely` (>=2.0).
+
 **Run the Python files directly**, no installation needed beyond the dependencies:
 ```
 pip install -r requirements.txt
