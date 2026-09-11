@@ -38,7 +38,7 @@ from gds_geometry_utils import (
     detect_and_delete_periphery_rings,
 )
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
@@ -425,13 +425,25 @@ def merge_polygons (polygons):
   Returns:
       _type_: LPPpolylist data
   """
+  # nothing to merge with a single polygon - skip straight to returning it
+  # as-is, which also sidesteps gdspy.boolean() returning None below for a
+  # degenerate/zero-area single shape (e.g. an EM port marker drawn as a
+  # zero-width sliver rectangle), which would otherwise crash on .polygons
+  if len(polygons) <= 1:
+    return list(polygons)
+
   mergedpolygonset=gdspy.boolean(polygons, None,"or", max_points=999)
+
+  # boolean() returns None when the resulting union is empty (degenerate
+  # input) - keep the original polygons rather than silently dropping them
+  if mergedpolygonset is None:
+    return list(polygons)
 
   # offset and boolean return PolygonSet, we only need the list of polygons from that
   return mergedpolygonset.polygons
 
 
-def merge_polygons_by_layer(cell):
+def merge_polygons_by_layer(cell, layers_list=None):
   """
   Merge (boolean OR) all polygons within each (layer, datatype) group of a
   flat cell into the minimal set of merged polygons. Reduces polygon count
@@ -440,6 +452,16 @@ def merge_polygons_by_layer(cell):
   stay separate. Only considers polygons directly in `cell` (depth=0),
   which is fine here since by this point in the pipeline the cell is
   already fully flattened.
+
+  layers_list: if given, only layers in this list are merged - every other
+  layer's polygons are copied through unchanged into the new cell. Leave as
+  None (default, matches the original behavior) to merge every layer found
+  in the cell. Restricting to known metal layers also sidesteps a real
+  crash: a zero-area/degenerate polygon (e.g. a via-port marker rectangle
+  drawn on its own non-metal layer) makes gdspy.boolean() return None for
+  that layer's group, and merge_polygons() then raises AttributeError
+  trying to read .polygons off it - skipping non-metal layers avoids ever
+  calling boolean() on them.
   """
   new_lib = gdspy.GdsLibrary()
   new_cell = gdspy.Cell(cell.name + "_merged_by_layer")
@@ -447,6 +469,10 @@ def merge_polygons_by_layer(cell):
   polys_by_layer = cell.get_polygons(by_spec=True, depth=0)
   for (layer, datatype), polys in polys_by_layer.items():
     if not polys:
+      continue
+    if layers_list is not None and layer not in layers_list:
+      for pts in polys:
+        new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
       continue
     merged_points = merge_polygons(polys)
     for pts in merged_points:
@@ -547,7 +573,14 @@ def merge_via_arrays_in_cell (input_cell, layers_list):
 # Helper functions for cutout removal
 # ----------------------------------------------
 
-def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None):
+def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_hole_area=None):
+  """
+  max_hole_area: if given, only cutouts whose total hole area is <=
+  max_hole_area get filled in (replaced by a solid outline) - larger holes
+  are left untouched. Leave as None (default) to fill every real cutout
+  found, regardless of size, matching the original behavior. This only
+  gates the "genuine cutout" branch, not thin-ring detection/deletion.
+  """
   # iterate over cells
   for cell in library:
     # print('cellname = ' + str(cell.name))
@@ -577,6 +610,9 @@ def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None):
             print(cell.name, ' deleting periphery ring polygon #', str(n), 'layer', str(poly_layer))
             poly.layers=[0]
             cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
+          elif max_hole_area is not None and sum(h.area for h in decomp["holes"]) > max_hole_area:
+            # cutout is larger than the requested threshold, leave it alone
+            pass
           else:
             # We can be sure we have a dummy shape with cutout.
             print(cell.name, ' replacing cutout polygon #', str(n), 'layer', str(poly_layer))
@@ -662,6 +698,9 @@ def main():
     parser.add_argument("--fill-mincount", type=int, default=20,
                          help="minimum number of same-size isolated polygons on a layer before they're "
                               "treated as removable fill (default: 20)")
+    parser.add_argument("--max-hole-area", type=float, default=None,
+                         help="maximum cutout area (microns squared) to fill in - larger cutouts are left "
+                              "untouched (default: no limit - every real cutout found is filled)")
     args = parser.parse_args()
     print_run_config(parser, args)
 
@@ -691,8 +730,10 @@ def main():
 
         # STEP 1: remove cutouts in the hierachical design, don't flatten at this stage
         # do this on metal layers (not via layers, not EM port layers)
-        print(f"\nSTEP 1: remove cutouts in the hierachical design, don't flatten at this stage")
-        lib = remove_cutout_keep_hierarchy (lib, metal_layers_list, design_bbox=design_bbox)
+        hole_area_desc = f'<= {args.max_hole_area}' if args.max_hole_area is not None else 'any size'
+        print(f"\nSTEP 1: remove cutouts in the hierachical design ({hole_area_desc}), don't flatten at this stage")
+        lib = remove_cutout_keep_hierarchy (lib, metal_layers_list, design_bbox=design_bbox,
+                                             max_hole_area=args.max_hole_area)
 
         # STEP 2: detect and delete thin ring/frame structures on the periphery
         # (e.g. seal rings). This has to run before via array merging, since it
@@ -743,7 +784,7 @@ def main():
         # trace) merges into one (or a few) large, usually unique shape.
         print('\nSTEP 5: merge polygons per layer')
         convert_top = gdspy.GdsLibrary(infile=tmp_path('converted.gds')).top_level()[0]
-        merged_by_layer_lib = merge_polygons_by_layer(convert_top)
+        merged_by_layer_lib = merge_polygons_by_layer(convert_top, layers_list=layers_list)
         merged_by_layer_lib.write_gds(tmp_path('merged_by_layer.gds'))
 
         # STEP 6: remove floating metals that are not connected to anything, if a

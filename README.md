@@ -2,7 +2,7 @@
 
 ---
 
-**Version 1.0: all-new, geometry-based algorithms across every tool, replacing the earlier hardcoded heuristics — for significantly cleaner and more general simplification output.**
+**Version 1.2: all-new, geometry-based algorithms across every tool, replacing the earlier hardcoded heuristics — for significantly cleaner and more general simplification output.**
 
 ---
 
@@ -52,9 +52,10 @@ Optional commandline parameters, and their default value if not given:
 - `--fill-minsize` - `1` (micron)
 - `--fill-maxsize` - no upper limit
 - `--fill-mincount` - `20` (how many repeats of the same size count as fill)
+- `--max-hole-area` - no upper limit (every real cutout found is filled); set this to leave larger cutouts untouched
 
 ```
-python gds_prepare_for_EM.py layout.gds cleaned_layout.gds --fill-minsize 1 --fill-maxsize 40 --fill-mincount 20
+python gds_prepare_for_EM.py layout.gds cleaned_layout.gds --fill-minsize 1 --fill-maxsize 40 --fill-mincount 20 --max-hole-area 1
 ```
 
 Starting from the example above, the resulting cleaned and simplified GDSII then looks like this:
