@@ -40,6 +40,7 @@ from gds_geometry_utils import (
     simplify_round_polygon_to_octagon,
     is_ring_candidate,
     detect_and_delete_periphery_rings,
+    validate_and_repair_polygons,
 )
 
 __version__ = "1.1"
@@ -214,6 +215,22 @@ def main():
   if top_cell_name is not None:
     print()
     detect_and_delete_periphery_rings(output_library, top_cell_name, apply=True)
+
+  # -------- Final polygon validity check/repair (always runs) --------
+  # catches any polygon still geometrically invalid (self-intersecting) no
+  # matter the reason - a solid-body mesher like gds2palace cannot handle
+  # this even though gdspy/GDSII themselves tolerate it.
+  print()
+  repaired_count, unresolved = validate_and_repair_polygons(output_library, layers_list)
+  if repaired_count:
+    print(f'  repaired {repaired_count} invalid polygon(s)')
+  if unresolved:
+    print(f'  WARNING: {len(unresolved)} polygon(s) could not be auto-repaired - '
+          f'these are still geometrically invalid in the output file:')
+    for cell_name, n, layer, reason in unresolved:
+      print(f'    {cell_name} polygon #{n} layer {layer}: {reason}')
+  if not repaired_count and not unresolved:
+    print('  Final validity check: no invalid polygons found')
 
   # write to output file
   output_library.write_gds(output_name)

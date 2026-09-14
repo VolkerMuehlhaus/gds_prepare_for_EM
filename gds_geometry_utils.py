@@ -1,7 +1,7 @@
 # Shared geometry utilities for GDSII layout simplification.
 # Used by gds_simplify.py and gds_prepare_for_EM.py.
 #
-# Covers three generalized simplification steps:
+# Covers four generalized simplification steps:
 # - decompose_polygon_holes: resolve a polygon-with-hole (GDSII's
 #   self-intersecting "bridge" encoding) into exterior + interior rings,
 #   for any hole shape/count/rotation - not just an axis-aligned square
@@ -13,6 +13,11 @@
 #   near a design's outer boundary (e.g. seal rings), which are commonly
 #   built as a hierarchy of segment cells rather than a single polygon
 #   with a hole, and delete their geometry.
+# - cut_holes_as_valid_polygons / validate_and_repair_polygons: re-encode a
+#   polygon-with-holes as geometrically valid (non-self-intersecting)
+#   output, and a final safety-net pass that checks every polygon on the
+#   layers of interest for validity regardless of which (if any) of the
+#   above steps touched it.
 
 ########################################################################
 #
@@ -34,10 +39,11 @@
 
 import math
 
+import gdspy
 import numpy as np
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.ops import unary_union
-from shapely.validation import make_valid
+from shapely.validation import make_valid, explain_validity
 
 
 # ============= hole / cutout decomposition =============
@@ -107,6 +113,101 @@ def decompose_polygon_holes(points, min_hole_area=1e-6):
         "exterior_area": exterior_area,
         "hole_area_fraction": hole_area_fraction,
     }
+
+
+# ============= valid hole re-encoding / final validity pass =============
+
+def cut_holes_as_valid_polygons(exterior_coords, holes, layer, datatype,
+                                 max_points_candidates=(8, 6, 5)):
+    """
+    Cut `holes` (a list of shapely Polygons, e.g. from decompose_polygon_holes())
+    out of `exterior_coords` (exterior ring points) using gdspy's own boolean
+    'not' operation, and return the result as a gdspy PolygonSet - or None if
+    no candidate setting produced fully valid output.
+
+    Why this isn't just `gdspy.boolean(..., 'not')` with defaults: gdspy's
+    default output for a polygon-with-holes is itself a single self-touching
+    "keyhole" bridge ring - the same style of encoding that caused the
+    problem in the first place, and confirmed (on a real 8-hole cutout) to
+    still be self-intersecting per shapely even after going through gdspy's
+    own boolean engine. Forcing gdspy's `max_points` fracturing (splitting
+    any result over that many vertices into several simple pieces instead of
+    one bridged ring) with a low enough value reliably produces valid,
+    non-self-intersecting pieces instead - so each candidate is tried in
+    turn (least material change first) and validated with shapely before
+    being accepted, since the "right" threshold isn't knowable in advance
+    and depends on the hole layout.
+    """
+    hole_coords = [list(h.exterior.coords) for h in holes]
+    for max_points in max_points_candidates:
+        result = gdspy.boolean([exterior_coords], hole_coords, 'not',
+                                max_points=max_points, layer=layer, datatype=datatype)
+        if result is None:
+            continue
+        if all(ShapelyPolygon(p).is_valid for p in result.polygons):
+            return result
+    return None
+
+
+def validate_and_repair_polygons(library, layers_list, min_hole_area=1e-6):
+    """
+    Final safety-net pass: check every polygon on `layers_list`, in every
+    cell of `library`, for geometric validity (shapely) - independent of
+    whether any earlier simplification step (cutout removal, floating-fill
+    removal, per-layer merge) already touched it. Catches anything those
+    steps didn't recognize or weren't asked to process - most notably a
+    cutout that remove_cutout_keep_hierarchy() deliberately left alone for
+    being larger than `max_hole_area` (its "hole preserved, not filled"
+    decision does not by itself guarantee the original bridge encoding was
+    valid), but also anything with a resolvable hole structure that never
+    matched the cutout heuristic to begin with.
+
+    An invalid polygon with a resolvable hole structure is repaired in place
+    via cut_holes_as_valid_polygons() - same fracturing approach as cutout
+    removal, so the hole is preserved, just re-encoded safely. A polygon
+    that's invalid for some other reason (e.g. a plain self-crossing bowtie
+    with no hole at all) is reported but left untouched, rather than
+    guessing at a fix - decompose_polygon_holes() already returns None for
+    exactly that "too ambiguous to handle generically" case.
+
+    Returns (repaired_count, unresolved): unresolved is a list of
+    (cell_name, polygon_index, layer, reason) tuples for anything still
+    invalid after this pass, for the caller to report/decide what to do.
+    """
+    repaired_count = 0
+    unresolved = []
+
+    for cell in library:
+        for n, poly in enumerate(list(cell.polygons)):
+            polypoints = poly.polygons[0]
+            poly_layer = poly.layers[0]
+            poly_purpose = poly.datatypes[0]
+
+            if poly_layer not in layers_list or len(polypoints) < 3:
+                continue
+
+            shapely_poly = ShapelyPolygon(polypoints)
+            if shapely_poly.is_valid:
+                continue
+
+            decomp = decompose_polygon_holes(polypoints, min_hole_area=min_hole_area)
+            fixed = cut_holes_as_valid_polygons(
+                decomp["exterior_coords"], decomp["holes"], poly_layer, poly_purpose
+            ) if decomp is not None else None
+
+            if fixed is not None:
+                print(cell.name, ': repairing invalid polygon #', str(n), 'layer', str(poly_layer))
+                poly.layers = [0]
+                cell.remove_polygons(lambda pts, layer, datatype: layer == 0)
+                cell.add(fixed)
+                repaired_count += 1
+            else:
+                reason = explain_validity(shapely_poly)
+                print(cell.name, ': COULD NOT AUTO-REPAIR invalid polygon #', str(n),
+                      'layer', str(poly_layer), '-', reason)
+                unresolved.append((cell.name, n, poly_layer, reason))
+
+    return repaired_count, unresolved
 
 
 # ============= circle detection =============

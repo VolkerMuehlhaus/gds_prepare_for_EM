@@ -36,6 +36,8 @@ from gds_geometry_utils import (
     simplify_round_polygon_to_octagon,
     is_ring_candidate,
     detect_and_delete_periphery_rings,
+    cut_holes_as_valid_polygons,
+    validate_and_repair_polygons,
 )
 
 __version__ = "1.2"
@@ -611,8 +613,28 @@ def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_ho
             poly.layers=[0]
             cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
           elif max_hole_area is not None and sum(h.area for h in decomp["holes"]) > max_hole_area:
-            # cutout is larger than the requested threshold, leave it alone
-            pass
+            # cutout is larger than the requested threshold - keep the hole (don't
+            # fill it in), but the original polygon's raw "bridge" hole encoding is
+            # not guaranteed to be geometrically valid (a solid-body mesher like
+            # gds2palace can choke on it) even though max_hole_area only ever meant
+            # to gate whether the hole gets FILLED, not whether the polygon is
+            # valid - so re-emit it as clean, hole-preserving geometry instead of
+            # leaving the original untouched.
+            hole_area = sum(h.area for h in decomp["holes"])
+            fixed = cut_holes_as_valid_polygons(decomp["exterior_coords"], decomp["holes"],
+                                                 poly_layer, poly_purpose)
+            if fixed is not None:
+              print(cell.name, ' re-encoding oversized cutout polygon #', str(n), 'layer', str(poly_layer),
+                    ' as valid geometry (hole area', f'{hole_area:.2f}', 'kept, not filled)')
+              poly.layers=[0]
+              cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
+              cell.add(fixed)
+            else:
+              # couldn't find a fracture that validates - fall back to leaving the
+              # original alone rather than silently discarding/guessing, but say so
+              print(cell.name, ' WARNING: could not re-encode oversized cutout polygon #', str(n),
+                    'layer', str(poly_layer), 'as valid geometry - leaving original as-is '
+                    '(hole area', f'{hole_area:.2f}', 'exceeds max_hole_area', max_hole_area, ')')
           else:
             # We can be sure we have a dummy shape with cutout.
             print(cell.name, ' replacing cutout polygon #', str(n), 'layer', str(poly_layer))
@@ -798,6 +820,25 @@ def main():
         print(f'\nSTEP 6: remove floating metals that are not connected to anything, size {size_desc}, repeating >= {mincount} times per size')
         premerged_top = gdspy.GdsLibrary(infile=tmp_path('merged_by_layer.gds')).top_level()[0]
         nofloat_lib = find_isolated_same_size_polygons_by_layer(premerged_top, metal_layers_list, minsize=minsize, maxsize=maxsize, mincount=mincount)
+
+        # STEP 7: final validity check/repair, independent of everything above -
+        # catches any polygon still geometrically invalid (self-intersecting) no
+        # matter the reason (e.g. a cutout STEP 1 deliberately left alone for
+        # being larger than --max-hole-area, or anything none of the earlier
+        # steps happened to touch at all). A solid-body mesher like gds2palace
+        # cannot handle this even though gdspy/GDSII themselves tolerate it, so
+        # this always runs, not just when other options are given.
+        print('\nSTEP 7: final polygon validity check/repair (always runs)')
+        repaired_count, unresolved = validate_and_repair_polygons(nofloat_lib, layers_list)
+        if repaired_count:
+            print(f'  repaired {repaired_count} invalid polygon(s)')
+        if unresolved:
+            print(f'  WARNING: {len(unresolved)} polygon(s) could not be auto-repaired - '
+                  f'these are still geometrically invalid in the output file:')
+            for cell_name, n, layer, reason in unresolved:
+                print(f'    {cell_name} polygon #{n} layer {layer}: {reason}')
+        if not repaired_count and not unresolved:
+            print('  no invalid polygons found')
 
         # SAVE RESULTS - the only GDS file left behind after this function returns
         nofloat_lib.write_gds(output_name)
