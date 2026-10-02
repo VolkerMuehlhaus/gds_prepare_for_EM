@@ -16,7 +16,7 @@ The picture below shows some typical challenges:
 1) To fulfill metal density rules, larger areas have been created as an array of squares with hole inside. This hole does not really matter for EM results, but it will lead to additional mesh cells and slow down mesh generation and simulation.
 For openEMS, the value of refined_cellsize can efficiently be used to skip small detail, but still those edges will slow down the meshing processing. For Palace, such small detail will all be included in mesh and it is absolutely required to remove this.
 2) On layer TopMetal2 shown as orange boxes on the top right side, and many other layers hidden here, the layout includes unconnected (floating) metal boxes that are used to fulfill density rules. Unlike auto-generated dummy metal fill, this man-made dummy metal fill is on purpose „drawing“ and can’t be skipped by the purpose (data type).
-3) Especially for pads, there is a massive amount of vias located in via arrays at rather large spacing. We can’t simplify increase the distance for via array merging in the gds2palace or gds2openEMS scripts, because that is a global setting and might also create unintentional short between adjacent via stacks.
+3) Especially for pads, there is a massive amount of vias located in via arrays at rather large spacing. A large distance for via array merging could merge adjacent via stacks that connect different metal shapes, and short them. gds_prepare_for_EM, gds2palace (0.8.1 and newer) and gds2openEMS only merge vias that connect the same metal shapes above and below.
 4) In the case shown here, the pads for copper pillar are round, which is represented in GDSII as a polygon with many vertices, resulting in over-meshing at these polygons, wasting simulation time.
 
 To solve these issues and create a more simulation-friendly layout, a collection of tools is provided here.
@@ -53,6 +53,7 @@ Optional commandline parameters, and their default value if not given:
 - `--fill-maxsize` - no upper limit
 - `--fill-mincount` - `20` (how many repeats of the same size count as fill)
 - `--max-hole-area` - no upper limit (every real cutout found is filled); set this to leave larger cutouts untouched
+- `--via-merge-size` - `2` (micron): vias closer than this are merged into one shape, but only if they connect the same metal shapes above and below, so via merging never shorts different metal shapes. The merged shape is clipped to the overlap of these metal shapes. `0` = no via merging.
 
 ```
 python gds_prepare_for_EM.py layout.gds cleaned_layout.gds --fill-minsize 1 --fill-maxsize 40 --fill-mincount 20 --max-hole-area 1
