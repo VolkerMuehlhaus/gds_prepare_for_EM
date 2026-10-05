@@ -36,14 +36,21 @@ from gds_geometry_utils import (
     simplify_round_polygon_to_octagon,
     is_ring_candidate,
     detect_and_delete_periphery_rings,
+    cut_holes_as_valid_polygons,
+    validate_and_repair_polygons,
 )
 
-__version__ = "1.2"
+__version__ = "1.3"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
 # instead of replaced by a solid shape
 RING_HOLE_FRACTION_THRESHOLD = 0.90
+
+# via array merging: vias closer than this (microns) are merged, if they
+# connect the same metal shapes above and below. Larger than the largest
+# IHP SG13G2 via spacing (TopVia2: 1.06 um), so every regular array merges.
+DEFAULT_VIA_MERGE_SIZE = 2.0
 
 
 # Step 1: single source of truth for layer number <-> name. To adapt this
@@ -327,92 +334,96 @@ def _best_overlapping_polygon(test_poly, rtree_idx, shapely_polys):
   return best_idx
 
 
-def merge_via_array_by_metal_overlap(via_polygons, above_polygons, below_polygons):
+def _merge_via_group(via_polygons, maxspacing):
   """
-  Replace a via array with clean, low-vertex solid via-region shapes.
+  Merge vias closer than maxspacing: oversize by half the spacing, OR,
+  undersize again. Same method and offset as gds2palace/gds2openEMS
+  merge_via_array(), so a given distance means the same in all tools.
+  Returns a list of shapely Polygons.
+  """
+  offset = maxspacing/2 + 0.01
+  grown = gdspy.offset(via_polygons, offset, join='miter', tolerance=2, precision=0.001, join_first=False, max_points=199)
+  merged = gdspy.boolean(grown, None, "or", max_points=199)
+  shrunk = gdspy.offset(merged, -offset, join='miter', tolerance=2, precision=0.001, join_first=False, max_points=199)
+  if shrunk is None:
+    return []
+  pieces = [ShapelyPolygon(p).buffer(0) for p in shrunk.polygons if len(p) >= 3]
+  # max_points can fracture one merged shape into several polygons, join them again
+  merged_shape = unary_union(pieces)
+  return [g for g in getattr(merged_shape, 'geoms', [merged_shape]) if g.geom_type == 'Polygon' and g.area > 0]
 
-  Rather than growing/merging/shrinking via shapes by a manually chosen
-  spacing (which traces a jagged boundary around the individual via
-  positions), this groups the vias by which metal-above polygon and which
-  metal-below polygon each one actually lands in. For every (above, below)
-  polygon pair that has at least one real via connecting them, it outputs
-  the overlap of three things: that specific metal-above polygon, that
-  specific metal-below polygon, AND the convex hull of the actual via
-  positions in that group.
 
-  The via-position hull matters: metal-above and metal-below can overlap
-  over a much bigger area than the (possibly sparse, even a single via)
-  cluster that actually connects them there - e.g. two wide routing
-  strips that cross and are joined by one via. Clipping only to the
-  above/below overlap would fill that whole crossing area with via
-  material, wildly overstating the real via footprint. Intersecting with
-  the via-position hull as well keeps the result close to where vias
-  actually are.
+def _polygon_to_points(polygon):
+  """
+  Shapely Polygon -> list of point arrays for gdspy. A polygon with holes
+  is cut with gdspy, which encodes the holes as keyholes.
+  """
+  exterior = np.array(polygon.exterior.coords[:-1])
+  if not polygon.interiors:
+    return [exterior]
+  holes = [np.array(ring.coords[:-1]) for ring in polygon.interiors]
+  result = gdspy.boolean([exterior], holes, "not", max_points=199)
+  return result.polygons if result is not None else []
 
-  This directly satisfies most of the properties we want, with no manual
-  distance parameter:
-  - the merge is naturally capped at "as large as the metal above and
-    below actually allow, and no bigger than where vias really are".
-  - vias belonging to different metal-above or metal-below polygons are
-    never merged together: distinct (above, below) pairs always produce
-    separate output shapes, so a merged via region can never bridge two
-    unrelated metal shapes.
 
-  A convex hull is NOT always low-vertex, though: that's only true for a
-  roughly rectangular via grid (hull = its 4-8 corners). A via array
-  arranged to fill a disk/circular footprint (matching a round pad above
-  it) has most of its via positions sitting on the hull, so the hull
-  traces a jagged staircase approximation of the circle - dozens to
-  hundreds of vertices, confirmed on a real 598-via cluster. Simplifying
-  the hull (Douglas-Peucker, tolerance scaled to the cluster's own size)
-  fixes this while barely changing its area, and offset-based
-  grow/merge/shrink smoothing was tried and does not converge to a clean
-  shape here even at offsets far larger than the cluster itself.
+def merge_via_array_by_metal_overlap(via_polygons, above_polygons, below_polygons,
+                                     maxspacing=DEFAULT_VIA_MERGE_SIZE, keep_unmatched=False):
+  """
+  Replace a via array with a few solid via shapes, without ever connecting
+  different metal shapes.
+
+  The vias are grouped by which metal-above polygon and which metal-below
+  polygon each one actually lands in. Each group is merged on its own:
+  vias closer than maxspacing are joined (oversize by half the spacing,
+  OR, undersize). The result is clipped to the overlap of that group's
+  metal-above and metal-below polygon.
+
+  - Vias of different metal-above or metal-below polygons are never merged
+    together, so a merged via can't short two metal shapes, however large
+    maxspacing is.
+  - Within a group, only vias closer than maxspacing are joined. Two via
+    arrays far apart on the same metal pair (e.g. both ends of a strapped
+    Metal1/Metal2 line) stay two shapes; they are not filled in between.
+  - A merged via never extends beyond the metal above or below it.
+
+  Vias without metal above or below are dropped, or kept unchanged with
+  keep_unmatched=True.
 
   Returns a list of point arrays (one per merged via shape).
   """
-  above_shapely = [ShapelyPolygon(p) for p in above_polygons if len(p) >= 3]
-  below_shapely = [ShapelyPolygon(p) for p in below_polygons if len(p) >= 3]
-  if not above_shapely or not below_shapely or not via_polygons:
+  if not via_polygons:
     return []
-
-  above_rtree = _rtree_from_shapely_polygons(above_shapely)
-  below_rtree = _rtree_from_shapely_polygons(below_shapely)
+  above_shapely = [ShapelyPolygon(p).buffer(0) for p in above_polygons if len(p) >= 3]
+  below_shapely = [ShapelyPolygon(p).buffer(0) for p in below_polygons if len(p) >= 3]
+  above_rtree = _rtree_from_shapely_polygons(above_shapely) if above_shapely else None
+  below_rtree = _rtree_from_shapely_polygons(below_shapely) if below_shapely else None
 
   # group vias by which (above-polygon, below-polygon) pair they land in
   pair_vias = defaultdict(list)
+  unmatched = []
   for via_pts in via_polygons:
     if len(via_pts) < 3:
       continue
     via_poly = ShapelyPolygon(via_pts)
     if via_poly.area <= 0:
       continue
-    above_i = _best_overlapping_polygon(via_poly, above_rtree, above_shapely)
-    below_i = _best_overlapping_polygon(via_poly, below_rtree, below_shapely)
+    above_i = _best_overlapping_polygon(via_poly, above_rtree, above_shapely) if above_rtree else None
+    below_i = _best_overlapping_polygon(via_poly, below_rtree, below_shapely) if below_rtree else None
     if above_i is None or below_i is None:
-      continue  # via without metal on one side - drop it, matches old AND-based behavior
-    pair_vias[(above_i, below_i)].append(via_poly)
+      unmatched.append(via_pts)  # via without metal on one side
+      continue
+    pair_vias[(above_i, below_i)].append(via_pts)
 
   merged_points = []
   for (above_i, below_i), vias in pair_vias.items():
-    via_extent = unary_union(vias).convex_hull
-
-    # simplify away the staircase jaggedness a hull can have around a
-    # non-rectangular (e.g. disk-shaped) via cluster; tolerance scales
-    # with the cluster's own size so a single/small via (already simple)
-    # is essentially untouched
-    minx, miny, maxx, maxy = via_extent.bounds
-    tolerance = min(maxx - minx, maxy - miny) * 0.02
-    if tolerance > 0:
-      via_extent = via_extent.simplify(tolerance, preserve_topology=True)
-
-    overlap = above_shapely[above_i].intersection(below_shapely[below_i]).intersection(via_extent)
-    if overlap.is_empty:
-      continue
-    parts = overlap.geoms if overlap.geom_type == 'MultiPolygon' else [overlap]
-    for part in parts:
-      if part.geom_type == 'Polygon' and part.area > 0:
-        merged_points.append(np.array(part.exterior.coords))
+    overlap = above_shapely[above_i].intersection(below_shapely[below_i])
+    for merged in _merge_via_group(vias, maxspacing):
+      clipped = merged.intersection(overlap)
+      for part in getattr(clipped, 'geoms', [clipped]):
+        if part.geom_type == 'Polygon' and part.area > 0:
+          merged_points.extend(_polygon_to_points(part))
+  if keep_unmatched:
+    merged_points.extend(np.array(v) for v in unmatched)
   return merged_points
 
 
@@ -499,7 +510,7 @@ def _merge_layers_in_place(cell, layers, datatype=0):
             cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
 
 
-def merge_via_arrays_in_cell (input_cell, layers_list):
+def merge_via_arrays_in_cell (input_cell, layers_list, maxspacing=DEFAULT_VIA_MERGE_SIZE):
 
     # create new library with new cell to hold polygons that are NOT removed
     new_lib = gdspy.GdsLibrary()
@@ -545,7 +556,7 @@ def merge_via_arrays_in_cell (input_cell, layers_list):
                     numpoly = len(layerpolygons)
                     print(f"Number of polygons on layer {layer}:{purpose}: {numpoly}")
 
-                    if layer in layer_above_dict:
+                    if layer in layer_above_dict and maxspacing > 0:
                         # via layer: replace the via array with clean solid
                         # shapes covering wherever metal-above and
                         # metal-below actually overlap around a real via
@@ -553,7 +564,7 @@ def merge_via_arrays_in_cell (input_cell, layers_list):
                         layer_below_polygons = LPPpolylist.get((layer_below_dict[layer], 0), [])  # drawing
 
                         merged_points = merge_via_array_by_metal_overlap(
-                            layerpolygons, layer_above_polygons, layer_below_polygons
+                            layerpolygons, layer_above_polygons, layer_below_polygons, maxspacing
                         )
                         for pts in merged_points:
                             new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=purpose))
@@ -611,8 +622,28 @@ def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_ho
             poly.layers=[0]
             cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
           elif max_hole_area is not None and sum(h.area for h in decomp["holes"]) > max_hole_area:
-            # cutout is larger than the requested threshold, leave it alone
-            pass
+            # cutout is larger than the requested threshold - keep the hole (don't
+            # fill it in), but the original polygon's raw "bridge" hole encoding is
+            # not guaranteed to be geometrically valid (a solid-body mesher like
+            # gds2palace can choke on it) even though max_hole_area only ever meant
+            # to gate whether the hole gets FILLED, not whether the polygon is
+            # valid - so re-emit it as clean, hole-preserving geometry instead of
+            # leaving the original untouched.
+            hole_area = sum(h.area for h in decomp["holes"])
+            fixed = cut_holes_as_valid_polygons(decomp["exterior_coords"], decomp["holes"],
+                                                 poly_layer, poly_purpose)
+            if fixed is not None:
+              print(cell.name, ' re-encoding oversized cutout polygon #', str(n), 'layer', str(poly_layer),
+                    ' as valid geometry (hole area', f'{hole_area:.2f}', 'kept, not filled)')
+              poly.layers=[0]
+              cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
+              cell.add(fixed)
+            else:
+              # couldn't find a fracture that validates - fall back to leaving the
+              # original alone rather than silently discarding/guessing, but say so
+              print(cell.name, ' WARNING: could not re-encode oversized cutout polygon #', str(n),
+                    'layer', str(poly_layer), 'as valid geometry - leaving original as-is '
+                    '(hole area', f'{hole_area:.2f}', 'exceeds max_hole_area', max_hole_area, ')')
           else:
             # We can be sure we have a dummy shape with cutout.
             print(cell.name, ' replacing cutout polygon #', str(n), 'layer', str(poly_layer))
@@ -698,6 +729,9 @@ def main():
     parser.add_argument("--fill-mincount", type=int, default=20,
                          help="minimum number of same-size isolated polygons on a layer before they're "
                               "treated as removable fill (default: 20)")
+    parser.add_argument("--via-merge-size", type=float, default=DEFAULT_VIA_MERGE_SIZE,
+                         help="via array merging: vias closer than this (microns) are merged, if they connect "
+                              "the same metal shapes above and below (default: %(default)s, 0 = no via merging)")
     parser.add_argument("--max-hole-area", type=float, default=None,
                          help="maximum cutout area (microns squared) to fill in - larger cutouts are left "
                               "untouched (default: no limit - every real cutout found is filled)")
@@ -752,10 +786,10 @@ def main():
             layers_list.append(layer)
 
         # STEP 3: via array merging, this also flattens the design hierarchy
-        print(f'\nSTEP 3: via array merging, this also flattens the design hierarchy')
+        print(f'\nSTEP 3: via array merging (distance {args.via_merge_size} um), this also flattens the design hierarchy')
         tmp_library = gdspy.GdsLibrary(infile=tmp_path('tmp.gds'))
         top = tmp_library.top_level()[0]
-        merged_lib = merge_via_arrays_in_cell (top, layers_list)
+        merged_lib = merge_via_arrays_in_cell (top, layers_list, args.via_merge_size)
         merged_lib.write_gds(tmp_path('merged.gds'))
 
         # STEP 4: replace circle-like polygons by octagons. This has to run
@@ -798,6 +832,25 @@ def main():
         print(f'\nSTEP 6: remove floating metals that are not connected to anything, size {size_desc}, repeating >= {mincount} times per size')
         premerged_top = gdspy.GdsLibrary(infile=tmp_path('merged_by_layer.gds')).top_level()[0]
         nofloat_lib = find_isolated_same_size_polygons_by_layer(premerged_top, metal_layers_list, minsize=minsize, maxsize=maxsize, mincount=mincount)
+
+        # STEP 7: final validity check/repair, independent of everything above -
+        # catches any polygon still geometrically invalid (self-intersecting) no
+        # matter the reason (e.g. a cutout STEP 1 deliberately left alone for
+        # being larger than --max-hole-area, or anything none of the earlier
+        # steps happened to touch at all). A solid-body mesher like gds2palace
+        # cannot handle this even though gdspy/GDSII themselves tolerate it, so
+        # this always runs, not just when other options are given.
+        print('\nSTEP 7: final polygon validity check/repair (always runs)')
+        repaired_count, unresolved = validate_and_repair_polygons(nofloat_lib, layers_list)
+        if repaired_count:
+            print(f'  repaired {repaired_count} invalid polygon(s)')
+        if unresolved:
+            print(f'  WARNING: {len(unresolved)} polygon(s) could not be auto-repaired - '
+                  f'these are still geometrically invalid in the output file:')
+            for cell_name, n, layer, reason in unresolved:
+                print(f'    {cell_name} polygon #{n} layer {layer}: {reason}')
+        if not repaired_count and not unresolved:
+            print('  no invalid polygons found')
 
         # SAVE RESULTS - the only GDS file left behind after this function returns
         nofloat_lib.write_gds(output_name)
