@@ -29,6 +29,7 @@ from rtree import index  # pip install rtree
 import numpy as np
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.ops import unary_union
+from shapely.validation import make_valid
 
 from gds_geometry_utils import (
     decompose_polygon_holes,
@@ -40,7 +41,7 @@ from gds_geometry_utils import (
     validate_and_repair_polygons,
 )
 
-__version__ = "1.4"
+__version__ = "1.5"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
@@ -494,6 +495,68 @@ def merge_polygons_by_layer(cell, layers_list=None):
   return new_lib
 
 
+def fill_repeated_holes_by_layer(cell, layers_list, mincount=20, max_hole_area=None, size_tol=1e-3):
+  """
+  Fill holes that only exist after per-layer merging (STEP 5): a metal mesh
+  (ground plane with a regular grid of openings) is often drawn as several
+  polygons whose seams cut right through a row of openings. Each piece then
+  only has a notch along its edge, not a hole, so remove_cutout_keep_hierarchy()
+  (STEP 1, per polygon) can't see it - the full hole only appears once the
+  pieces are merged.
+
+  Merging can also enclose a real, one-off opening (e.g. the aperture around
+  an antenna), which must stay open. So only holes whose bbox size repeats at
+  least `mincount` times on the same layer/datatype are filled - the same
+  "repeats often enough to be a pattern" test floating-fill removal uses.
+  `max_hole_area`, if given, additionally caps the area of a filled hole.
+
+  Returns a new library; layers without any qualifying holes are copied
+  through unchanged.
+  """
+  new_lib = gdspy.GdsLibrary()
+  # same name as the input cell, so this step leaves no trace in the output
+  # top cell name (exclude_from_current: gdspy already registered that name)
+  new_cell = gdspy.Cell(cell.name, exclude_from_current=True)
+
+  polys_by_layer = cell.get_polygons(by_spec=True, depth=0)
+  for (layer, datatype), polys in polys_by_layer.items():
+    fill_holes = []
+    if layer in layers_list and polys:
+      # union of all pieces (merge_polygons() fractures to max_points, so one
+      # hole can be enclosed by several output polygons)
+      parts = []
+      for pts in polys:
+        geom = make_valid(ShapelyPolygon(pts))
+        parts.extend(g for g in getattr(geom, 'geoms', [geom]) if g.geom_type == "Polygon" and g.area > 0)
+      union = unary_union(parts)
+      holes = [ShapelyPolygon(ring) for g in getattr(union, 'geoms', [union]) if g.geom_type == "Polygon"
+               for ring in g.interiors]
+
+      holes_by_size = defaultdict(list)
+      for hole in holes:
+        xmin, ymin, xmax, ymax = hole.bounds
+        holes_by_size[(round((xmax - xmin) / size_tol), round((ymax - ymin) / size_tol))].append(hole)
+
+      for (w, h), group in holes_by_size.items():
+        if len(group) < mincount:
+          continue
+        if max_hole_area is not None:
+          group = [hole for hole in group if hole.area <= max_hole_area]
+        if group:
+          print(f'Layer {layer}:{datatype}: filled {len(group)} repeated holes of size ({w * size_tol:g},{h * size_tol:g})')
+          fill_holes.extend(group)
+
+    if fill_holes:
+      merged_points = merge_polygons(list(polys) + [np.array(hole.exterior.coords)[:-1] for hole in fill_holes])
+    else:
+      merged_points = polys
+    for pts in merged_points:
+      new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
+
+  new_lib.add(new_cell)
+  return new_lib
+
+
 def _merge_layers_in_place(cell, layers, datatype=0):
     """
     Merge (boolean OR) all polygons on each (layer, datatype) in `layers`
@@ -823,6 +886,18 @@ def main():
         merged_by_layer_lib = merge_polygons_by_layer(convert_top, layers_list=layers_list)
         merged_by_layer_lib.write_gds(tmp_path('merged_by_layer.gds'))
 
+        # STEP 5b: fill holes that only appear after merging - a mesh drawn as
+        # several polygons whose seams cut through a row of openings leaves only
+        # notches per polygon, so STEP 1 can't see them. Only holes whose size
+        # repeats >= --fill-mincount times on a layer are filled, so a one-off
+        # opening enclosed by merging (e.g. an antenna aperture) stays open.
+        hole_area_desc = f', area <= {args.max_hole_area}' if args.max_hole_area is not None else ''
+        print(f'\nSTEP 5b: fill holes created by merging, if the same size repeats >= {args.fill_mincount} times per layer{hole_area_desc}')
+        merged_top = gdspy.GdsLibrary(infile=tmp_path('merged_by_layer.gds')).top_level()[0]
+        holes_filled_lib = fill_repeated_holes_by_layer(merged_top, metal_layers_list, mincount=args.fill_mincount,
+                                                        max_hole_area=args.max_hole_area)
+        holes_filled_lib.write_gds(tmp_path('holes_filled.gds'))
+
         # STEP 6: remove floating metals that are not connected to anything, if a
         # same size repeats at least --fill-mincount times on a layer. Nothing
         # after this point introduces new touching geometry (removal only
@@ -832,7 +907,7 @@ def main():
         mincount = args.fill_mincount
         size_desc = f'{minsize}..{maxsize}' if maxsize is not None else f'>= {minsize} (no upper limit)'
         print(f'\nSTEP 6: remove floating metals that are not connected to anything, size {size_desc}, repeating >= {mincount} times per size')
-        premerged_top = gdspy.GdsLibrary(infile=tmp_path('merged_by_layer.gds')).top_level()[0]
+        premerged_top = gdspy.GdsLibrary(infile=tmp_path('holes_filled.gds')).top_level()[0]
         nofloat_lib = find_isolated_same_size_polygons_by_layer(premerged_top, metal_layers_list, minsize=minsize, maxsize=maxsize, mincount=mincount)
 
         # STEP 7: final validity check/repair, independent of everything above -
