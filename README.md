@@ -47,11 +47,13 @@ python gds_simplify.py layout.gds --exclude-layers 126,134
 ## gds_prepare_for_EM
 The all-in-one tool: runs all of the above plus via-array simplification (replacing dense via arrays with a handful of clean shapes) and round-pad-to-octagon conversion, producing a single simulation-ready output file in one pass.
 
+It also fills holes that only appear once neighbouring polygons are merged, e.g. a meshed ground plane drawn as several polygons whose seams cut through rows of openings. Such a hole is filled only if holes of the same size repeat at least `--fill-mincount` times on a layer, so a one-off opening enclosed by merged metal (e.g. the aperture around an antenna) stays open.
+
 Optional commandline parameters, and their default value if not given:
 - `output filename` (second positional argument) - `<input>_cleaned.gds`
 - `--fill-minsize` - `1` (micron)
 - `--fill-maxsize` - no upper limit
-- `--fill-mincount` - `20` (how many repeats of the same size count as fill)
+- `--fill-mincount` - `20` (how many repeats of the same size count as fill, or as a hole pattern to fill)
 - `--max-hole-area` - no upper limit (every real cutout found is filled); set this to leave larger cutouts untouched
 - `--via-merge-size` - `2` (micron): vias closer than this are merged into one shape, but only if they connect the same metal shapes above and below, so via merging never shorts different metal shapes. The merged shape is clipped to the overlap of these metal shapes. `0` = no via merging.
 
