@@ -109,7 +109,7 @@ These tools are written against the IHP SG13G2 GDSII layer/purpose numbering. To
 
 | Item | Values | Purpose |
 |---|---|---|
-| `LAYER_NAMES` (layer number <-> name) | `1`=Activ, `6`=Cont, `8`=Metal1, `9`=Passiv, `10`=Metal2, `19`=Via1, `29`=Via2, `30`=Metal3, `36`=MIM, `41`=Pillar, `49`=Via3, `50`=Metal4, `66`=Via4, `67`=Metal5, `125`=TopVia1, `126`=TopMetal1, `129`=Vmim, `133`=TopVia2, `134`=TopMetal2 | Defines which GDSII layer numbers are metals/vias and their names; everything else (metal lists, via lists) derives from this |
+| `LAYER_NAMES` (layer number <-> name) | `1`=Activ, `6`=Cont, `8`=Metal1, `9`=Passiv, `10`=Metal2, `19`=Via1, `29`=Via2, `30`=Metal3, `36`=MIM, `41`=Pillar, `49`=Via3, `50`=Metal4, `66`=Via4, `67`=Metal5, `125`=TopVia1, `126`=TopMetal1, `129`=Vmim, `133`=TopVia2, `134`=TopMetal2, `157`=LBE | Defines which GDSII layer numbers are metals/vias and their names; everything else (metal lists, via lists) derives from this |
 | `VIA_ABOVE_BELOW` | Cont: Metal1/Activ, Via1: Metal2/Metal1, Via2: Metal3/Metal2, Via3: Metal4/Metal3, Via4: Metal5/Metal4, Vmim: TopMetal1/MIM, TopVia1: TopMetal1/Metal5, TopVia2: TopMetal2/TopMetal1 | SG13G2's specific via stack topology - which metal sits above/below each via layer, used for via-array merging |
 | `EXTRA_VIA_LIKE_NAMES` | `Passiv`, `Pillar` | Layers that aren't real vias but should still be excluded from floating-fill removal |
 | `exclude_purpose_list` (excluded from output entirely) | `28`=noqrc, `22`=filler, `23`=nofill, `21`=block | SG13G2 GDSII purpose/datatype numbers |

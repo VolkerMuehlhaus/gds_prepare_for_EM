@@ -43,7 +43,7 @@ from gds_geometry_utils import (
     validate_and_repair_polygons,
 )
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 
 # ==================== settings =========================
@@ -74,6 +74,7 @@ LAYER_NAMES = {
   129: "Vmim",
   133: "TopVia2",
   134: "TopMetal2",
+  157: "LBE",
 }
 NAME_TO_LAYER = {name: layer for layer, name in LAYER_NAMES.items()}
 

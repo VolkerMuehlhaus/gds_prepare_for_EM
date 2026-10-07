@@ -40,7 +40,7 @@ from gds_geometry_utils import (
     validate_and_repair_polygons,
 )
 
-__version__ = "1.3"
+__version__ = "1.4"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
@@ -76,6 +76,7 @@ LAYER_NAMES = {
   129: "Vmim",
   133: "TopVia2",
   134: "TopMetal2",
+  157: "LBE",
 }
 NAME_TO_LAYER = {name: layer for layer, name in LAYER_NAMES.items()}
 
@@ -779,7 +780,8 @@ def main():
         lib.write_gds(tmp_path('tmp.gds'))
 
         # define layers for processing
-        layers_list = metal_layers_list
+        # copy, not alias: extending must not leak vias/port layers into metal_layers_list
+        layers_list = list(metal_layers_list)
         layers_list.extend(via_layers_list)
         # in addition to IHP layers, also keep layers above 200 that we use for ports etc.
         for layer in range(201,250):
