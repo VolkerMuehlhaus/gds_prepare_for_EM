@@ -97,6 +97,25 @@ gds_prepare_for_EM layout.gds
 gds_prepare_for_EM layout.gds cleaned_layout.gds
 ```
 
+## Use from Python (stackup-driven simplification)
+
+`gds_simplify_for_em` runs the same steps from Python, with the layers taken from a gds2palace XML stackup instead of the IHP SG13G2 layer names. setupEM's Tools > Simplify GDS and the gds2palace MCP server use it.
+
+```python
+from gds2palace import stackup_reader, utilities
+from gds_simplify_for_em import layers_from_stackup, run_simplify, estimate_polygon_count_by_layer
+
+_, _, metals_list = stackup_reader.read_substrate(utilities.get_stackup_path("SG13G2_FEM_200um.xml"))
+metal_layers, via_layers = layers_from_stackup(metals_list)    # port layers 201-299 are left out
+
+print(estimate_polygon_count_by_layer("layout.gds", "", purposelist=[0]))   # {layer: count}, no flattening
+run_simplify("layout.gds", metal_layers, "layout_simplified.gds",
+             do_floating=True, do_cutouts=True, via_layers=via_layers, via_merge_size=1.0)
+```
+
+- `run_simplify()`: fills small cutouts, removes floating fill, merges each layer and merges via arrays (vias closer than `via_merge_size` that connect the same metal shapes above and below), in this order, then checks and repairs polygon validity.
+- `estimate_polygon_count()` / `estimate_polygon_count_by_layer()`: the polygon count of a cell, from the cell hierarchy without flattening it, so it is fast even for dense fill and via arrays.
+
 # License
 
 This project is licensed under the Apache License, Version 2.0 - see [LICENSE](./LICENSE) for the full text.
