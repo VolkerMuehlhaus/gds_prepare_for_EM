@@ -67,13 +67,27 @@ def _flatten_cell(lib, cellname):
     hits an internal bug on some in-memory-only reference structures ('tuple'
     object does not support item assignment) that only a GDS write+read
     cycle avoids - same workaround gds_prepare_for_EM.py's own CLI pipeline
-    uses before every flatten() call in its main()."""
+    uses before every flatten() call in its main().
+
+    The former subcells of top_cell that nothing references any more are
+    removed from the library. Otherwise they stay in the output as extra
+    top-level cells, and a reader that takes the first top-level cell (like
+    gds2palace's read_gds() without a cellname) can pick one of them instead
+    of the design. Other top-level cells of the input and their subcells are
+    kept."""
     with tempfile.TemporaryDirectory(prefix="setupEM_simplify_") as tmp_dir:
         tmp_path = os.path.join(tmp_dir, "pre_flatten.gds")
         lib.write_gds(tmp_path)
         lib = gdspy.GdsLibrary(infile=tmp_path)
     top_cell = lib.cells.get(cellname, lib.top_level()[0])
+    subcells = top_cell.get_dependencies(True)
     top_cell.flatten()
+    # removing an orphan can orphan its own subcells, so repeat until none is left
+    orphans = [c for c in lib.top_level() if c in subcells]
+    while orphans:
+        for cell in orphans:
+            lib.remove(cell)
+        orphans = [c for c in lib.top_level() if c in subcells]
     return lib, top_cell
 
 
