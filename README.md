@@ -115,6 +115,7 @@ run_simplify("layout.gds", metal_layers, "layout_simplified.gds",
 
 - `run_simplify()`: fills small cutouts, removes floating fill, merges each layer and merges via arrays (vias closer than `via_merge_size` that connect the same metal shapes above and below), in this order, then checks and repairs polygon validity.
 - `estimate_polygon_count()` / `estimate_polygon_count_by_layer()`: the polygon count of a cell, from the cell hierarchy without flattening it, so it is fast even for dense fill and via arrays.
+- `ground_plane_holes()` / `run_simplify(..., fill_ground_holes=True)`: openings in ground planes, measured in the layout. Each metal layer is merged first, so holes drawn inside tiles and gaps left between side-by-side tiles are the same kind of opening. A merged shape is a ground plane if, with its holes filled, it is large (at least 10 % of the layout's bounding box) and solid (at least 60 % of its own bounding box). Openings of one size that occur at least 20 times on a layer (cheesing, a tiled mesh) are filled; other openings, which belong to the circuit, and holes in shapes that are not ground planes stay. There is no size threshold: only the repeated sizes found in the layout are filled.
 
 # License
 
