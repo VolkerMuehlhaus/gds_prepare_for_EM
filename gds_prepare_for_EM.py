@@ -41,7 +41,7 @@ from gds_geometry_utils import (
     validate_and_repair_polygons,
 )
 
-__version__ = "1.7"
+__version__ = "1.7.1"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
@@ -846,9 +846,11 @@ def main():
         # copy, not alias: extending must not leak vias/port layers into metal_layers_list
         layers_list = list(metal_layers_list)
         layers_list.extend(via_layers_list)
-        # in addition to IHP layers, also keep layers above 200 that we use for ports etc.
-        for layer in range(201,250):
-            layers_list.append(layer)
+        # in addition to IHP layers, also keep every layer above 200 of the design, unchanged: EM ports (201..299),
+        # substrate/backside ground sheets (250, 251), thermal markers (300 and up) and other user layers. Only
+        # 201..249 were kept before; a via array merge (STEP 3) writes only the layers of layers_list.
+        design_layers = gdspy.GdsLibrary(infile=tmp_path('tmp.gds')).top_level()[0].get_layers()
+        layers_list.extend(sorted(layer for layer in design_layers if layer > 200 and layer not in layers_list))
 
         # STEP 3: via array merging, this also flattens the design hierarchy
         print(f'\nSTEP 3: via array merging (distance {args.via_merge_size} um), this also flattens the design hierarchy')

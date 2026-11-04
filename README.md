@@ -135,7 +135,7 @@ These tools are written against the IHP SG13G2 GDSII layer/purpose numbering. To
 | `VIA_ABOVE_BELOW` | Cont: Metal1/Activ, Via1: Metal2/Metal1, Via2: Metal3/Metal2, Via3: Metal4/Metal3, Via4: Metal5/Metal4, Vmim: TopMetal1/MIM, TopVia1: TopMetal1/Metal5, TopVia2: TopMetal2/TopMetal1 | SG13G2's specific via stack topology - which metal sits above/below each via layer, used for via-array merging |
 | `EXTRA_VIA_LIKE_NAMES` | `Passiv`, `Pillar` | Layers that aren't real vias but should still be excluded from floating-fill removal |
 | `exclude_purpose_list` (excluded from output entirely) | `28`=noqrc, `22`=filler, `23`=nofill, `21`=block | SG13G2 GDSII purpose/datatype numbers |
-| Port-layer convention | `layers_list` extended with `range(201, 250)` | Not an IHP PDK layer range - a pipeline-wide convention (shared with `gds2palace_ihp_sg13g2`/`openems_ihp_sg13g2`) for EM port polygons drawn by the user on layers `201`-`249`, above the PDK's own layer numbers, so those are always kept regardless of `LAYER_NAMES` above |
+| Layers above 200 | `layers_list` extended with every layer above 200 found in the design | Not an IHP PDK layer range - a pipeline-wide convention (shared with `gds2palace_ihp_sg13g2`/`openems_ihp_sg13g2`) for layers drawn by the user above the PDK's own layer numbers: EM ports (`201`-`299`), substrate/backside ground sheets (`250`, `251`), thermal heat sources and boundaries (`300` and up, e.g. `401`-`499`). They are kept unchanged, regardless of `LAYER_NAMES` above. Before 1.7.1 only `201`-`249` were kept |
 
 ## gds_simplify.py
 
