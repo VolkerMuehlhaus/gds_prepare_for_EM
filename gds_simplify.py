@@ -31,6 +31,7 @@
 
 
 import argparse
+import sys
 
 import gdspy
 
@@ -41,9 +42,10 @@ from gds_geometry_utils import (
     is_ring_candidate,
     detect_and_delete_periphery_rings,
     validate_and_repair_polygons,
+    design_cell,
 )
 
-__version__ = "1.2"
+__version__ = "1.3"
 
 
 # ==================== settings =========================
@@ -130,6 +132,9 @@ def main():
   parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
   parser.add_argument("input_gds", help="input GDSII file")
   parser.add_argument("--exclude-layers", help="comma-separated layer numbers to exclude from the built-in default set")
+  parser.add_argument("--cell", default=None,
+                      help="the design cell, for the seal ring detection (default: the top-level cell with the "
+                           "largest bounding box, not KLayout's $$$CONTEXT_INFO$$$)")
   args = parser.parse_args()
   print_run_config(parser, args)
 
@@ -144,9 +149,14 @@ def main():
   # Read GDSII library
   output_library = gdspy.GdsLibrary(infile=input_name)
 
-  top_cells = output_library.top_level()
-  top_cell_name = top_cells[0].name if top_cells else None
-  design_bbox = top_cells[0].get_bounding_box() if top_cells else None
+  # the design cell, for the seal ring detection: the first top-level cell can be another one
+  try:
+    design = design_cell(output_library, args.cell)[0]
+  except ValueError as e:
+    sys.exit(f"ERROR: {e}")
+  print(f"Cell: {design.name}")
+  top_cell_name = design.name
+  design_bbox = design.get_bounding_box()
 
   # iterate over cells
   for cell in output_library:

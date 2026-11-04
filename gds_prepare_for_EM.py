@@ -22,6 +22,7 @@
 
 import argparse
 import os
+import sys
 import tempfile
 import gdspy
 from collections import defaultdict
@@ -39,6 +40,8 @@ from gds_geometry_utils import (
     detect_and_delete_periphery_rings,
     cut_holes_as_valid_polygons,
     validate_and_repair_polygons,
+    design_cell,
+    only_cell,
 )
 
 __version__ = "1.7.1"
@@ -796,6 +799,9 @@ def main():
     parser.add_argument("--via-merge-size", type=float, default=DEFAULT_VIA_MERGE_SIZE,
                          help="via array merging: vias closer than this (microns) are merged, if they connect "
                               "the same metal shapes above and below (default: %(default)s, 0 = no via merging)")
+    parser.add_argument("--cell", default=None,
+                         help="the design cell (default: the top-level cell with the largest bounding box, "
+                              "not KLayout's $$$CONTEXT_INFO$$$)")
     parser.add_argument("--max-hole-area", type=float, default=None,
                          help="maximum cutout area (microns squared) to fill in - larger cutouts are left "
                               "untouched (default: no limit - every real cutout found is filled)")
@@ -821,6 +827,15 @@ def main():
 
         lib = gdspy.GdsLibrary()
         lib.read_gds(input_name)
+
+        # the design cell, alone with its subcells: every later step takes the first top-level cell
+        try:
+            design, others = design_cell(lib, args.cell)
+        except ValueError as e:
+            sys.exit(f"ERROR: {e}")
+        print(f"Cell: {design.name}" + (f" (other top-level cells, left out: {', '.join(others)}; "
+                                        "choose another one with --cell)" if others else ""))
+        lib = only_cell(lib, design)
 
         top_cells = lib.top_level()
         top_cell_name = top_cells[0].name if top_cells else None

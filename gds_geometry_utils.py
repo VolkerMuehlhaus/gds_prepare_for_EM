@@ -533,3 +533,30 @@ def detect_and_delete_periphery_rings(library, top_cell_name, apply=True,
                     print(f"  Deleted {count} polygon(s) from cell {name} (referenced from {candidate['cell_name']})")
 
     return candidates
+
+
+def design_cell(lib, name=None):
+    """(cell, names of the other top-level cells) of the design to prepare: the cell called name, else the top-level
+    cell with the largest bounding box. KLayout's $$$CONTEXT_INFO$$$ (and other $$$ cells) never count. A file can
+    have several top-level cells, e.g. device cells placed nowhere; taking the first one prepared the wrong cell.
+    Raises ValueError if there is no such cell."""
+    tops = [c for c in lib.top_level() if not c.name.startswith("$$$")]
+    if name:
+        if name not in lib.cells:
+            raise ValueError(f"no cell {name} in the file; top-level cells: {', '.join(c.name for c in tops)}")
+        return lib.cells[name], [c.name for c in tops if c.name != name]
+    if not tops:
+        raise ValueError("no design cell in the file")
+
+    def area(cell):
+        box = cell.get_bounding_box()
+        return 0 if box is None else (box[1][0] - box[0][0]) * (box[1][1] - box[0][1])
+    cell = max(tops, key=area)
+    return cell, [c.name for c in tops if c is not cell]
+
+
+def only_cell(lib, cell):
+    """A library with cell and its subcells only (unit and precision of lib)."""
+    out = gdspy.GdsLibrary(unit=lib.unit, precision=lib.precision)
+    out.add(cell, include_dependencies=True)
+    return out

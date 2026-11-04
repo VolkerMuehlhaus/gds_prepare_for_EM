@@ -26,6 +26,7 @@ Removes unconnected (floating) man-made dummy metal fill. A shape only counts as
 
 Optional commandline parameters, and their default value if not given:
 - `output filename` (second positional argument) - `<input>_cleaned.gds`
+- `--cell` - the top-level cell with the largest bounding box (KLayout's `$$$CONTEXT_INFO$$$` never counts); the log names the cell and the other top-level cells. Before, the first top-level cell was taken, which in a file with several of them could be another cell than the design
 - `--minsize` - `1` (micron)
 - `--maxsize` - no upper limit
 - `--mincount` - `20` (how many repeats of the same size count as fill)
@@ -39,6 +40,7 @@ Replaces density-fill cutouts (squares/shapes with a hole punched in them) with 
 
 Optional commandline parameters, and their default value if not given:
 - `--exclude-layers` - none (the full built-in default layer set is processed)
+- `--cell` - as for gds_removefill; used for the seal ring detection, all cells are simplified
 
 ```
 python gds_simplify.py layout.gds --exclude-layers 126,134
@@ -51,6 +53,7 @@ It also fills holes that only appear once neighbouring polygons are merged, e.g.
 
 Optional commandline parameters, and their default value if not given:
 - `output filename` (second positional argument) - `<input>_cleaned.gds`
+- `--cell` - the top-level cell with the largest bounding box (KLayout's `$$$CONTEXT_INFO$$$` never counts); the log names the cell and the other top-level cells. Before, the first top-level cell was taken, which in a file with several of them could be another cell than the design
 - `--fill-minsize` - `1` (micron)
 - `--fill-maxsize` - no upper limit
 - `--fill-mincount` - `20` (how many repeats of the same size count as fill, or as a hole pattern to fill)
@@ -156,4 +159,6 @@ These tools are written against the IHP SG13G2 GDSII layer/purpose numbering. To
 
 ## gds_geometry_utils.py / tools/gds_diff.py
 
-Neither file contains any PDK-specific values - both work purely on generic polygon geometry (hole/cutout decomposition, circle detection, periphery ring detection, structural diffing) and apply to any GDSII layout.
+Neither file contains any PDK-specific values - both work purely on generic polygon geometry (hole/cutout decomposition, circle detection, periphery ring detection, design cell selection, structural diffing) and apply to any GDSII layout.
+
+`python tools/gds_diff.py [--flat] a.gds b.gds` compares the polygons and paths per cell and (layer, datatype): count, area and vertex counts, and ends with a summary line (also "no differences"). Cells are compared by name; `--flat` compares the two design cells flattened instead, whatever their names, e.g. a layout against gds_prepare_for_EM's output, whose cell is flattened and renamed.
