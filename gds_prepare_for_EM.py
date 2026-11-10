@@ -22,6 +22,7 @@
 
 import argparse
 import os
+import sys
 import tempfile
 import gdspy
 from collections import defaultdict
@@ -39,9 +40,11 @@ from gds_geometry_utils import (
     detect_and_delete_periphery_rings,
     cut_holes_as_valid_polygons,
     validate_and_repair_polygons,
+    design_cell,
+    only_cell,
 )
 
-__version__ = "1.7"
+__version__ = "1.7.1"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
@@ -796,6 +799,9 @@ def main():
     parser.add_argument("--via-merge-size", type=float, default=DEFAULT_VIA_MERGE_SIZE,
                          help="via array merging: vias closer than this (microns) are merged, if they connect "
                               "the same metal shapes above and below (default: %(default)s, 0 = no via merging)")
+    parser.add_argument("--cell", default=None,
+                         help="the design cell (default: the top-level cell with the largest bounding box, "
+                              "not KLayout's $$$CONTEXT_INFO$$$)")
     parser.add_argument("--max-hole-area", type=float, default=None,
                          help="maximum cutout area (microns squared) to fill in - larger cutouts are left "
                               "untouched (default: no limit - every real cutout found is filled)")
@@ -822,6 +828,15 @@ def main():
         lib = gdspy.GdsLibrary()
         lib.read_gds(input_name)
 
+        # the design cell, alone with its subcells: every later step takes the first top-level cell
+        try:
+            design, others = design_cell(lib, args.cell)
+        except ValueError as e:
+            sys.exit(f"ERROR: {e}")
+        print(f"Cell: {design.name}" + (f" (other top-level cells, left out: {', '.join(others)}; "
+                                        "choose another one with --cell)" if others else ""))
+        lib = only_cell(lib, design)
+
         top_cells = lib.top_level()
         top_cell_name = top_cells[0].name if top_cells else None
         design_bbox = top_cells[0].get_bounding_box() if top_cells else None
@@ -846,9 +861,11 @@ def main():
         # copy, not alias: extending must not leak vias/port layers into metal_layers_list
         layers_list = list(metal_layers_list)
         layers_list.extend(via_layers_list)
-        # in addition to IHP layers, also keep layers above 200 that we use for ports etc.
-        for layer in range(201,250):
-            layers_list.append(layer)
+        # in addition to IHP layers, also keep every layer above 200 of the design, unchanged: EM ports (201..299),
+        # substrate/backside ground sheets (250, 251), thermal markers (300 and up) and other user layers. Only
+        # 201..249 were kept before; a via array merge (STEP 3) writes only the layers of layers_list.
+        design_layers = gdspy.GdsLibrary(infile=tmp_path('tmp.gds')).top_level()[0].get_layers()
+        layers_list.extend(sorted(layer for layer in design_layers if layer > 200 and layer not in layers_list))
 
         # STEP 3: via array merging, this also flattens the design hierarchy
         print(f'\nSTEP 3: via array merging (distance {args.via_merge_size} um), this also flattens the design hierarchy')

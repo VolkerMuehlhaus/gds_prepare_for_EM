@@ -20,12 +20,15 @@
 ########################################################################
 
 import argparse
+import sys
 import gdspy
 from collections import defaultdict
 from rtree import index  # pip install rtree
 import numpy as np
 
-__version__ = "1.0"
+from gds_geometry_utils import design_cell
+
+__version__ = "1.1"
 
 
 # Layer number <-> name mapping. To adapt this tool to a different
@@ -102,8 +105,14 @@ def touches_any(poly, rtree_idx, all_polys, precision=1e-5):
 
 
 def merge_polygons(polygons):
-    """Merge (boolean OR) a list of LPPpolylist-style polygons, return the merged point-arrays."""
+    """Merge (boolean OR) a list of LPPpolylist-style polygons, return the merged point-arrays. As
+    gds_prepare_for_EM.merge_polygons: a single polygon is returned as it is, and an empty union (degenerate input,
+    e.g. an EM port marker drawn as a zero-width sliver) keeps the original polygons instead of crashing."""
+    if len(polygons) <= 1:
+        return list(polygons)
     mergedpolygonset = gdspy.boolean(polygons, None, "or", max_points=999)
+    if mergedpolygonset is None:
+        return list(polygons)
     return mergedpolygonset.polygons
 
 
@@ -268,6 +277,9 @@ def main():
                          help="maximum polygon bbox size (microns) to consider for floating-fill removal "
                               "(default: no limit - a same-size group is judged by how often it repeats "
                               "instead, see --mincount)")
+    parser.add_argument("--cell", default=None,
+                         help="the design cell (default: the top-level cell with the largest bounding box, "
+                              "not KLayout's $$$CONTEXT_INFO$$$)")
     parser.add_argument("--mincount", type=int, default=20,
                          help="minimum number of same-size isolated polygons on a layer before they're "
                               "treated as removable fill (default: 20)")
@@ -281,7 +293,12 @@ def main():
 
     lib = gdspy.GdsLibrary()
     lib.read_gds(input_name)
-    top = lib.top_level()[0]
+    try:
+        top, others = design_cell(lib, args.cell)       # the first top-level cell can be another one
+    except ValueError as e:
+        sys.exit(f"ERROR: {e}")
+    print(f"Cell: {top.name}" + (f" (other top-level cells, left out: {', '.join(others)}; choose another one "
+                                 "with --cell)" if others else ""))
     top.flatten()
 
     # merge touching same-layer polygons first - see touches_any() for why

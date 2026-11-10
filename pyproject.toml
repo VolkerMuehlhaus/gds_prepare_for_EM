@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gds_prepare_for_EM"
-version = "1.7.0"
+version = "1.7.1"
 description = "Simplify IHP SG13G2 GDSII layouts for EM simulation (Palace, openEMS)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -28,6 +28,9 @@ dependencies = [
     "shapely>=2.0",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.urls]
 Homepage = "https://github.com/VolkerMuehlhaus/gds_prepare_for_EM"
 Repository = "https://github.com/VolkerMuehlhaus/gds_prepare_for_EM"
@@ -39,3 +42,7 @@ gds_removefill = "gds_removefill:main"
 
 [tool.setuptools]
 py-modules = ["gds_prepare_for_EM", "gds_simplify", "gds_removefill", "gds_geometry_utils", "gds_simplify_for_em"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["golden: the real test cases in testcases/ against tests/golden/ (~30 s)"]
