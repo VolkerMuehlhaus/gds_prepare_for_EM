@@ -75,6 +75,25 @@ def decompose_polygon_holes(points, min_hole_area=1e-6):
 
     fixed = raw if raw.is_valid else make_valid(raw)
 
+    if not raw.is_valid:
+        # make_valid() decides what is inside from the noded lines, so it can
+        # drop a part of the shape: a slit that runs along a hole edge (as
+        # KLayout writes it) passes the root of a strip reaching into the hole
+        # twice, and the strip then counts as part of the hole. gdspy's boolean
+        # follows the winding of the boundary and keeps it. If the two disagree
+        # on the area, take the shape from gdspy's pieces instead.
+        reference = gdspy.boolean([points], None, "or", max_points=199)
+        if reference is not None and abs(fixed.area - reference.area()) > 1e-9 * reference.area():
+            fixed = None
+            for max_points in (8, 6, 5):
+                result = gdspy.boolean([points], None, "or", max_points=max_points)
+                pieces = [ShapelyPolygon(p) for p in result.polygons]
+                if all(p.is_valid for p in pieces):
+                    fixed = unary_union(pieces)
+                    break
+            if fixed is None:
+                return None  # leave the original polygon alone
+
     if fixed.geom_type == "GeometryCollection":
         # make_valid() on a GDSII "bridge" polygon (outer ring -> zero-width
         # slit -> inner ring -> slit back) typically returns the resolved
