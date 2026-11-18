@@ -46,7 +46,7 @@ from gds_geometry_utils import (
     flat_polygon_cell,
 )
 
-__version__ = "1.7.2"
+__version__ = "1.8.0"
 
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted

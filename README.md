@@ -2,6 +2,15 @@
 
 ---
 
+**Version 1.8: the tools now use gdstk instead of gdspy, and are 3 to 15 times faster.** Layouts where gdspy never finished (it could hang on some polygons with holes) now run in seconds.
+
+Results change in three places. Simulations of a layout prepared with 1.8 are not directly comparable with ones prepared with 1.7:
+- **Merged vias are complete.** Before, shrinking a merged via back after merging cut strips of up to about 2 µm out of it, along the slit that encodes a hole and along fracture lines. Rings of vias came out cut open. Merged via area typically goes up by 0.5 to 10%, and by up to 25% on large via fields.
+- **Circuit blocks are no longer deleted as seal rings** when their wiring is drawn as paths and only fill sits along their border.
+- **Without `--cell`, setupEM's Simplify GDS and the gds2palace MCP server take the design cell**, the same one the command-line tools take: the largest top-level cell, never KLayout's `$$$CONTEXT_INFO$$$`. Before, they took the first top-level cell, and for some KLayout files the output contained only `$$$CONTEXT_INFO$$$`.
+
+`open_gds_cell()` in gds_simplify_for_em now returns gdstk objects. setupEM and gds2palace_mcp need versions that support this.
+
 **Version 1.2: all-new, geometry-based algorithms across every tool, replacing the earlier hardcoded heuristics — for significantly cleaner and more general simplification output.**
 
 ---

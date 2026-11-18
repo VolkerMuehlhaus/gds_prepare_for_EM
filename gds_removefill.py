@@ -28,7 +28,7 @@ import numpy as np
 
 from gds_geometry_utils import design_cell, polygons_by_spec
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 
 # Layer number <-> name mapping. To adapt this tool to a different
