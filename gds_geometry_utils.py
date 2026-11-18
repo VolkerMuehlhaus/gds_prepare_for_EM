@@ -304,7 +304,7 @@ def simplify_round_polygon_to_octagon(points, min_size=0):
 # ============= periphery ring detection =============
 
 def compute_bbox(points_list):
-    """Bounding box, in the same ((xmin,ymin),(xmax,ymax)) format gdspy uses."""
+    """Bounding box, in the same ((xmin,ymin),(xmax,ymax)) format gdstk uses."""
     xs = []
     ys = []
     for pts in points_list:
@@ -582,11 +582,8 @@ def cells_by_name(lib):
 
 
 def polygons_by_spec(cell, depth=None):
-    """{(layer, datatype): [point arrays]} of a cell's polygons and paths (as polygons), like gdspy's
-    get_polygons(by_spec=True). depth=0: the cell's own shapes only, None: the whole hierarchy flattened. Takes a
-    gdstk or a gdspy cell (open_gds_cell() gives gdspy cells to setupEM and the gds2palace MCP server)."""
-    if not isinstance(cell, gdstk.Cell):
-        return cell.get_polygons(by_spec=True, depth=depth)
+    """{(layer, datatype): [point arrays]} of a cell's polygons and paths (as polygons). depth=0: the cell's own
+    shapes only, None: the whole hierarchy flattened."""
     result = defaultdict(list)
     for p in cell.get_polygons(depth=depth, include_paths=True):
         result[(p.layer, p.datatype)].append(p.points)
@@ -594,8 +591,8 @@ def polygons_by_spec(cell, depth=None):
 
 
 def cell_bounding_box(cell):
-    """((xmin, ymin), (xmax, ymax)) of a gdstk or gdspy cell, None if empty."""
-    return cell.bounding_box() if isinstance(cell, gdstk.Cell) else cell.get_bounding_box()
+    """((xmin, ymin), (xmax, ymax)) of a cell, None if empty."""
+    return cell.bounding_box()
 
 
 def cell_layers(cell):

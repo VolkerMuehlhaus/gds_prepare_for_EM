@@ -1,5 +1,5 @@
 # gds_removefill: floating fill (a size that repeats often enough) goes, design metal stays, and a zero-width EM
-# port marker no longer crashes its polygon merge (gdspy.boolean returns None for it).
+# port marker no longer crashes its polygon merge (the boolean drops it).
 
 from conftest import design_summary, run_tool, write_gds
 

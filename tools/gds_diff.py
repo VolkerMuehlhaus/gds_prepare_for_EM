@@ -12,7 +12,7 @@
 # Always ends with a summary line, also when nothing differs.
 
 import sys
-import gdspy
+import gdstk
 
 
 def polygon_area(points):
@@ -40,7 +40,7 @@ def design_cell(lib):
     tops = [c for c in lib.top_level() if not c.name.startswith("$$$")] or lib.top_level()
 
     def area(cell):
-        box = cell.get_bounding_box()
+        box = cell.bounding_box()
         return 0 if box is None else (box[1][0] - box[0][0]) * (box[1][1] - box[0][1])
     return max(tops, key=area)
 
@@ -49,22 +49,23 @@ def load_summary(path, flat=False):
     """Return {cell_name: {(layer, datatype): {"count": int, "verts": [int], "area": float}}}: each cell's own
     shapes (polygons and paths, without its subcells), or with flat the design cell flattened, under the name
     "(design)"."""
-    lib = gdspy.GdsLibrary(infile=path)
+    lib = gdstk.read_gds(path)
     if flat:
-        return {"(design)": summarize(design_cell(lib).get_polygons(by_spec=True))}
-    return {cell.name: summarize(own_shapes(cell)) for cell in lib.cells.values()}
+        return {"(design)": summarize(by_spec(design_cell(lib).get_polygons(include_paths=True)))}
+    return {cell.name: summarize(own_shapes(cell)) for cell in lib.cells}
+
+
+def by_spec(polygons):
+    """{(layer, datatype): [points]} of gdstk polygons."""
+    shapes = {}
+    for p in polygons:
+        shapes.setdefault((p.layer, p.datatype), []).append(p.points)
+    return shapes
 
 
 def own_shapes(cell):
     """{(layer, datatype): [points]} of the cell's own polygons and paths, without its references."""
-    shapes = {}
-    for poly in cell.polygons:
-        for pts, layer, datatype in zip(poly.polygons, poly.layers, poly.datatypes):
-            shapes.setdefault((layer, datatype), []).append(pts)
-    for path in cell.paths:
-        for key, polygons in path.get_polygons(by_spec=True).items():
-            shapes.setdefault(key, []).extend(polygons)
-    return shapes
+    return by_spec(list(cell.polygons) + [p for path in cell.paths for p in path.to_polygons()])
 
 
 def format_verts(verts):

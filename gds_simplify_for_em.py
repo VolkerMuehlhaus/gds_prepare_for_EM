@@ -31,7 +31,6 @@
 #
 ########################################################################
 
-import gdspy
 import gdstk
 
 from gds_geometry_utils import cell_bounding_box, cells_by_name, polygons_by_spec
@@ -255,7 +254,6 @@ def ground_plane_holes(cell, layers_list, mincount=20, size_tol=1e-3):
 
     Returns {(layer, datatype): {"ground_planes": n, "repeated": {(w, h): [holes]},
     "other": {(w, h): [holes]}, "outside_ground": n}} with shapely hole Polygons.
-    cell: a gdstk cell, or a gdspy cell (from open_gds_cell(), as the gds2palace MCP server passes it).
     """
     from shapely.geometry import Polygon as ShapelyPolygon
 
@@ -308,24 +306,14 @@ def fill_ground_plane_holes(cell, layers_list, mincount=20, size_tol=1e-3):
 
 
 def open_gds_cell(gds_path, cellname):
-    """Open gds_path and resolve the target cell: cellname if given and
-    found, else the file's first top-level cell. Raises on a bad file or a
-    library with no top-level cell, same as gdspy itself would - callers
-    already wrap their own call sites in a broad try/except.
+    """Open gds_path with gdstk and resolve the target cell: cellname if
+    given and found, else the file's first top-level cell. Raises on a bad
+    file or a library with no top-level cell - callers already wrap their
+    own call sites in a broad try/except.
 
-    Returns gdspy objects (library, cell): setupEM and the gds2palace MCP
-    server walk them. This package itself works with gdstk, see
-    _open_gdstk_cell().
+    Returns gdstk objects (library, cell). Up to version 1.7 these were
+    gdspy objects; setupEM and the gds2palace MCP server walk them.
     """
-    library = gdspy.GdsLibrary(infile=gds_path)
-    top_level = library.top_level()
-    if not top_level:
-        raise ValueError(f"no top-level cell in {gds_path}")
-    return library, library.cells.get(cellname, top_level[0])
-
-
-def _open_gdstk_cell(gds_path, cellname):
-    """As open_gds_cell(), with gdstk (much faster on large files)."""
     library = gdstk.read_gds(gds_path)
     if not library.top_level():
         raise ValueError(f"no top-level cell in {gds_path}")
@@ -348,7 +336,7 @@ def estimate_polygon_count(gds_path, cellname, layernumbers, purposelist):
     surface that error properly instead).
     """
     try:
-        library, cell = _open_gdstk_cell(gds_path, cellname)
+        library, cell = open_gds_cell(gds_path, cellname)
     except Exception:
         return None
 
@@ -379,7 +367,7 @@ def estimate_polygon_count_by_layer(gds_path, cellname, purposelist=None):
     {layer number: polygon count}, without flattening the hierarchy.
     Raises on a file that can't be opened (unlike estimate_polygon_count).
     """
-    library, cell = _open_gdstk_cell(gds_path, cellname)
+    library, cell = open_gds_cell(gds_path, cellname)
     purposeset = set(int(p) for p in purposelist) if purposelist else None
 
     memo = {}

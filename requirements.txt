@@ -1,4 +1,3 @@
-gdspy
 gdstk
 rtree
 numpy

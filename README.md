@@ -73,7 +73,7 @@ Starting from the example above, the resulting cleaned and simplified GDSII then
 
 There are two ways to use these tools - pick whichever fits your workflow.
 
-Requires Python 3.9+ and these libraries: `gdstk`, `gdspy`, `rtree`, `numpy`, `shapely` (>=2.0). The tools work with gdstk; gdspy is still needed for `open_gds_cell()` in gds_simplify_for_em, which gives setupEM and the gds2palace MCP server gdspy objects.
+Requires Python 3.9+ and these libraries: `gdstk`, `rtree`, `numpy`, `shapely` (>=2.0). Up to version 1.7 the tools used gdspy.
 
 **Run the Python files directly**, no installation needed beyond the dependencies:
 ```
