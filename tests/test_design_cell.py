@@ -1,7 +1,7 @@
 # The design cell of a file with several top-level cells: the largest one (never KLayout's $$$CONTEXT_INFO$$$), or
 # the one given with --cell. All three command-line tools took the first top-level cell before.
 
-import gdspy
+import gdstk
 import pytest
 
 from conftest import design_summary, run_tool, top_cell_names, write_gds
@@ -19,14 +19,14 @@ def layout(tmp_path):
 
 
 def test_design_cell(layout):
-    lib = gdspy.GdsLibrary(infile=layout)
+    lib = gdstk.read_gds(layout)
     cell, others = design_cell(lib)
     assert cell.name == "DESIGN" and sorted(others) == ["small_device"]
     assert design_cell(lib, "small_device")[0].name == "small_device"
     with pytest.raises(ValueError, match="no cell nope"):
         design_cell(lib, "nope")
     alone = only_cell(lib, cell)
-    assert sorted(c.name for c in alone.cells.values()) == ["DESIGN", "DEVICE"]
+    assert sorted(c.name for c in alone.cells) == ["DESIGN", "DEVICE"]
 
 
 def test_prepare_takes_the_design_cell(layout, tmp_path):

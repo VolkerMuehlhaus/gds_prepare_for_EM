@@ -31,10 +31,10 @@
 #
 ########################################################################
 
-import os
-import tempfile
-
 import gdspy
+import gdstk
+
+from gds_geometry_utils import cell_bounding_box, cells_by_name, polygons_by_spec
 
 # conventional GDS layer range for port (and thermal) polygons in gds2palace/setupEM,
 # same fallback as setupEM's Preferences > Ports
@@ -70,13 +70,14 @@ def layers_from_stackup(metals_list, port_layer_range=DEFAULT_PORT_LAYER_RANGE):
     return metal_layers, via_layers
 
 
+def _top_cell(lib, cellname):
+    """The cell called cellname, else the first top-level cell."""
+    return cells_by_name(lib).get(cellname) or lib.top_level()[0]
+
+
 def _flatten_cell(lib, cellname):
-    """Return (lib, top_cell) with top_cell flattened in place. Round-trips
-    through a temporary GDS file first: gdspy's flatten()/get_polygonsets()
-    hits an internal bug on some in-memory-only reference structures ('tuple'
-    object does not support item assignment) that only a GDS write+read
-    cycle avoids - same workaround gds_prepare_for_EM.py's own CLI pipeline
-    uses before every flatten() call in its main().
+    """Return (lib, top_cell) with top_cell flattened in place, its paths
+    converted to polygons.
 
     The former subcells of top_cell that nothing references any more are
     removed from the library. Otherwise they stay in the output as extra
@@ -84,18 +85,17 @@ def _flatten_cell(lib, cellname):
     gds2palace's read_gds() without a cellname) can pick one of them instead
     of the design. Other top-level cells of the input and their subcells are
     kept."""
-    with tempfile.TemporaryDirectory(prefix="setupEM_simplify_") as tmp_dir:
-        tmp_path = os.path.join(tmp_dir, "pre_flatten.gds")
-        lib.write_gds(tmp_path)
-        lib = gdspy.GdsLibrary(infile=tmp_path)
-    top_cell = lib.cells.get(cellname, lib.top_level()[0])
-    subcells = top_cell.get_dependencies(True)
+    top_cell = _top_cell(lib, cellname)
+    subcells = set(top_cell.dependencies(True))
     top_cell.flatten()
+    paths = top_cell.paths
+    if paths:
+        top_cell.add(*[p for path in paths for p in path.to_polygons()])
+        top_cell.remove(*paths)
     # removing an orphan can orphan its own subcells, so repeat until none is left
     orphans = [c for c in lib.top_level() if c in subcells]
     while orphans:
-        for cell in orphans:
-            lib.remove(cell)
+        lib.remove(*orphans)
         orphans = [c for c in lib.top_level() if c in subcells]
     return lib, top_cell
 
@@ -137,25 +137,15 @@ def run_simplify(gds_path, metal_layers, output_path, cellname="",
     )
     from gds_geometry_utils import validate_and_repair_polygons
 
-    # merge_polygons_by_layer()/find_isolated_same_size_polygons_by_layer()
-    # create cells via the bare gdspy.Cell(...) constructor, which
-    # auto-registers each one into gdspy's persistent global
-    # gdspy.current_library - harmless for the CLI (a fresh process every
-    # run) but in this long-running GUI, a second Run on the same file
-    # would reuse the same cell names and gdspy raises "already present in
-    # library". Starting from a fresh current_library each call clears that
-    # accumulated state without touching gds_prepare_for_EM itself.
-    gdspy.current_library = gdspy.GdsLibrary()
-
-    lib = gdspy.GdsLibrary()
-    lib.read_gds(gds_path)
-    top_cell = lib.cells.get(cellname, lib.top_level()[0])
+    lib = gdstk.read_gds(gds_path)
+    unit, precision = lib.unit, lib.precision
+    top_cell = _top_cell(lib, cellname)
 
     if do_cutouts:
-        design_bbox = top_cell.get_bounding_box()
+        design_bbox = top_cell.bounding_box()
         lib = remove_cutout_keep_hierarchy(lib, metal_layers, design_bbox=design_bbox,
                                             max_hole_area=max_hole_area)
-        top_cell = lib.cells.get(cellname, lib.top_level()[0])
+        top_cell = _top_cell(lib, cellname)
 
     # floating-fill removal already ends with a flattened, per-layer-merged
     # cell (it needs that itself, to tell a floating fill cluster apart from
@@ -182,7 +172,7 @@ def run_simplify(gds_path, metal_layers, output_path, cellname="",
 
     if via_layers and via_merge_size > 0:
         lib, top_cell = _flatten_cell(lib, cellname)
-        lpp = top_cell.get_polygons(by_spec=True)
+        lpp = polygons_by_spec(top_cell)
         print(f'Via array merging (distance {via_merge_size} um):')
 
         def metal_polygons(layers):
@@ -199,10 +189,9 @@ def run_simplify(gds_path, metal_layers, output_path, cellname="",
                 vias = lpp[(via_layer, purpose)]
                 merged = merge_via_array_by_metal_overlap(
                     vias, above, below, via_merge_size, keep_unmatched=True)
-                top_cell.remove_polygons(
-                    lambda pts, layer, datatype: layer == via_layer and datatype == purpose)
-                for pts in merged:
-                    top_cell.add(gdspy.Polygon(pts, layer=via_layer, datatype=purpose))
+                # filter: one pass over the cell (remove() searches the cell once per polygon)
+                top_cell.filter([(via_layer, purpose)], remove=True, paths=False, labels=False)
+                top_cell.add(*[gdstk.Polygon(pts, layer=via_layer, datatype=purpose) for pts in merged])
                 print(f'  layer {via_layer}:{purpose}: {len(vias)} -> {len(merged)} polygons')
 
     # Final polygon validity check/repair - always runs, regardless of which
@@ -212,7 +201,7 @@ def run_simplify(gds_path, metal_layers, output_path, cellname="",
     # larger than max_hole_area, or a merge step re-introducing an invalid
     # "bridge" hole encoding while fusing polygons back together. A
     # solid-body mesher like gds2palace cannot handle this even though
-    # gdspy/GDSII themselves tolerate it.
+    # GDSII itself tolerates it.
     repaired_count, unresolved = validate_and_repair_polygons(lib, metal_layers)
     if repaired_count:
         print(f'Final validity check: repaired {repaired_count} invalid polygon(s)')
@@ -224,7 +213,10 @@ def run_simplify(gds_path, metal_layers, output_path, cellname="",
     if not repaired_count and not unresolved:
         print('Final validity check: no invalid polygons found')
 
-    lib.write_gds(output_path)
+    # in the unit of the input file; max_points: gdstk would otherwise
+    # fracture every polygon over 199 vertices on writing, gdspy didn't
+    lib.unit, lib.precision = unit, precision
+    lib.write_gds(output_path, max_points=8190)
 
 
 def _merged_parts(polygons):
@@ -263,13 +255,14 @@ def ground_plane_holes(cell, layers_list, mincount=20, size_tol=1e-3):
 
     Returns {(layer, datatype): {"ground_planes": n, "repeated": {(w, h): [holes]},
     "other": {(w, h): [holes]}, "outside_ground": n}} with shapely hole Polygons.
+    cell: a gdstk cell, or a gdspy cell (from open_gds_cell(), as the gds2palace MCP server passes it).
     """
     from shapely.geometry import Polygon as ShapelyPolygon
 
-    (x0, y0), (x1, y1) = cell.get_bounding_box()
+    (x0, y0), (x1, y1) = cell_bounding_box(cell)
     layout_area = (x1 - x0) * (y1 - y0)
     result = {}
-    for (layer, datatype), polys in cell.get_polygons(by_spec=True).items():
+    for (layer, datatype), polys in polygons_by_spec(cell).items():
         if layer not in layers_list or not polys:
             continue
         parts = _merged_parts(polys)
@@ -301,33 +294,47 @@ def fill_ground_plane_holes(cell, layers_list, mincount=20, size_tol=1e-3):
     from gds_prepare_for_EM import merge_polygons
 
     measured = ground_plane_holes(cell, layers_list, mincount, size_tol)
-    new_lib = gdspy.GdsLibrary()
-    new_cell = gdspy.Cell(cell.name, exclude_from_current=True)
-    for (layer, datatype), polys in cell.get_polygons(by_spec=True, depth=0).items():
+    new_lib = gdstk.Library()
+    new_cell = gdstk.Cell(cell.name)
+    for (layer, datatype), polys in polygons_by_spec(cell, depth=0).items():
         fill = []
         for (w, h), holes in measured.get((int(layer), int(datatype)), {}).get("repeated", {}).items():
             print(f"Layer {layer}:{datatype}: filled {len(holes)} repeated ground plane holes of size ({w:g},{h:g})")
             fill.extend(np.array(hole.exterior.coords)[:-1] for hole in holes)
         merged = merge_polygons(list(polys) + fill) if fill else polys
-        for pts in merged:
-            new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
+        new_cell.add(*[gdstk.Polygon(pts, layer=layer, datatype=datatype) for pts in merged])
     new_lib.add(new_cell)
     return new_lib, measured
 
 
 def open_gds_cell(gds_path, cellname):
     """Open gds_path and resolve the target cell: cellname if given and
-    found, else the file's first top-level cell. Shared first step for
-    every walker below. Raises on a bad file or a library with no top-level
-    cell, same as gdspy itself would - callers already wrap their own call
-    sites in a broad try/except.
+    found, else the file's first top-level cell. Raises on a bad file or a
+    library with no top-level cell, same as gdspy itself would - callers
+    already wrap their own call sites in a broad try/except.
+
+    Returns gdspy objects (library, cell): setupEM and the gds2palace MCP
+    server walk them. This package itself works with gdstk, see
+    _open_gdstk_cell().
     """
     library = gdspy.GdsLibrary(infile=gds_path)
     top_level = library.top_level()
     if not top_level:
         raise ValueError(f"no top-level cell in {gds_path}")
-    cell = library.cells.get(cellname, top_level[0])
-    return library, cell
+    return library, library.cells.get(cellname, top_level[0])
+
+
+def _open_gdstk_cell(gds_path, cellname):
+    """As open_gds_cell(), with gdstk (much faster on large files)."""
+    library = gdstk.read_gds(gds_path)
+    if not library.top_level():
+        raise ValueError(f"no top-level cell in {gds_path}")
+    return library, _top_cell(library, cellname)
+
+
+def _placements(ref):
+    """How many times a reference places its cell (an array reference: columns * rows)."""
+    return max(ref.repetition.size, 1)
 
 
 def estimate_polygon_count(gds_path, cellname, layernumbers, purposelist):
@@ -341,7 +348,7 @@ def estimate_polygon_count(gds_path, cellname, layernumbers, purposelist):
     surface that error properly instead).
     """
     try:
-        library, cell = open_gds_cell(gds_path, cellname)
+        library, cell = _open_gdstk_cell(gds_path, cellname)
     except Exception:
         return None
 
@@ -354,18 +361,13 @@ def estimate_polygon_count(gds_path, cellname, layernumbers, purposelist):
         if c.name in memo:
             return memo[c.name]
         total = 0
-        for polygonset in c.polygons:
-            for layer, datatype in zip(polygonset.layers, polygonset.datatypes):
-                if int(layer) in layernumbers and (purposeset is None or int(datatype) in purposeset):
-                    total += 1
+        for polygon in c.polygons:
+            if polygon.layer in layernumbers and (purposeset is None or polygon.datatype in purposeset):
+                total += 1
         for ref in c.references:
-            ref_cell = ref.ref_cell
-            if isinstance(ref_cell, str):
-                ref_cell = library.cells.get(ref_cell)
-            if ref_cell is None:
-                continue
-            sub = count(ref_cell)
-            total += sub * ref.columns * ref.rows if isinstance(ref, gdspy.CellArray) else sub
+            if not isinstance(ref.cell, gdstk.Cell):
+                continue  # cell missing from the file
+            total += count(ref.cell) * _placements(ref)
         memo[c.name] = total
         return total
 
@@ -377,7 +379,7 @@ def estimate_polygon_count_by_layer(gds_path, cellname, purposelist=None):
     {layer number: polygon count}, without flattening the hierarchy.
     Raises on a file that can't be opened (unlike estimate_polygon_count).
     """
-    library, cell = open_gds_cell(gds_path, cellname)
+    library, cell = _open_gdstk_cell(gds_path, cellname)
     purposeset = set(int(p) for p in purposelist) if purposelist else None
 
     memo = {}
@@ -386,18 +388,14 @@ def estimate_polygon_count_by_layer(gds_path, cellname, purposelist=None):
         if c.name in memo:
             return memo[c.name]
         totals = {}
-        for polygonset in c.polygons:
-            for layer, datatype in zip(polygonset.layers, polygonset.datatypes):
-                if purposeset is None or int(datatype) in purposeset:
-                    totals[int(layer)] = totals.get(int(layer), 0) + 1
+        for polygon in c.polygons:
+            if purposeset is None or polygon.datatype in purposeset:
+                totals[polygon.layer] = totals.get(polygon.layer, 0) + 1
         for ref in c.references:
-            ref_cell = ref.ref_cell
-            if isinstance(ref_cell, str):
-                ref_cell = library.cells.get(ref_cell)
-            if ref_cell is None:
-                continue
-            factor = ref.columns * ref.rows if isinstance(ref, gdspy.CellArray) else 1
-            for layer, n in count(ref_cell).items():
+            if not isinstance(ref.cell, gdstk.Cell):
+                continue  # cell missing from the file
+            factor = _placements(ref)
+            for layer, n in count(ref.cell).items():
                 totals[layer] = totals.get(layer, 0) + n * factor
         memo[c.name] = totals
         return totals

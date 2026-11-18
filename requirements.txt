@@ -1,4 +1,5 @@
 gdspy
+gdstk
 rtree
 numpy
 shapely>=2.0
