@@ -320,6 +320,17 @@ def _shapely_polygons(point_arrays):
   return out
 
 
+def _metal_shapes(polygons):
+  """The metal shapes of a layer as shapely Polygons: the polygons joined where they touch or overlap.
+  merge_polygons() fractures large merged shapes into several polygons; joined again, a via on a fracture line
+  belongs to its metal shape, not to whichever piece the fracture happened to put more of it in."""
+  parts = [ShapelyPolygon(p).buffer(0) for p in polygons if len(p) >= 3]
+  union = unary_union(parts) if parts else None
+  if union is None or union.is_empty:
+    return []
+  return [g for g in getattr(union, 'geoms', [union]) if g.geom_type == 'Polygon' and g.area > 0]
+
+
 def _best_overlapping_polygons(vias, metals):
   """
   For each via (numpy array of shapely Polygons), the index of the polygon
@@ -416,8 +427,8 @@ def merge_via_array_by_metal_overlap(via_polygons, above_polygons, below_polygon
   vias = [np.asarray(v, dtype=float) for v in via_polygons if len(v) >= 3]
   if not vias:
     return []
-  above_shapely = [ShapelyPolygon(p).buffer(0) for p in above_polygons if len(p) >= 3]
-  below_shapely = [ShapelyPolygon(p).buffer(0) for p in below_polygons if len(p) >= 3]
+  above_shapely = _metal_shapes(above_polygons)
+  below_shapely = _metal_shapes(below_polygons)
 
   via_shapely = _shapely_polygons(vias)
   has_area = shapely.area(via_shapely) > 0
