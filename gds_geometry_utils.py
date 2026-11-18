@@ -550,7 +550,10 @@ def design_cell(lib, name=None):
     """(cell, names of the other top-level cells) of the design to prepare: the cell called name, else the top-level
     cell with the largest bounding box. KLayout's $$$CONTEXT_INFO$$$ (and other $$$ cells) never count. A file can
     have several top-level cells, e.g. device cells placed nowhere; taking the first one prepared the wrong cell.
-    Raises ValueError if there is no such cell."""
+    Raises ValueError if there is no such cell.
+
+    The same rule as gds2palace's and gds2openEMS's select_design_cell() (util_gds_reader), so all tools take the
+    same cell when none is named: keep them in sync."""
     tops = [c for c in lib.top_level() if not isinstance(c, gdstk.RawCell) and not c.name.startswith("$$$")]
     if name:
         by_name = cells_by_name(lib)

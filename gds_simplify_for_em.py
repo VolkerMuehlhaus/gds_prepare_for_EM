@@ -33,7 +33,7 @@
 
 import gdstk
 
-from gds_geometry_utils import cell_bounding_box, cells_by_name, polygons_by_spec
+from gds_geometry_utils import cell_bounding_box, cells_by_name, design_cell, polygons_by_spec
 
 # conventional GDS layer range for port (and thermal) polygons in gds2palace/setupEM,
 # same fallback as setupEM's Preferences > Ports
@@ -70,8 +70,17 @@ def layers_from_stackup(metals_list, port_layer_range=DEFAULT_PORT_LAYER_RANGE):
 
 
 def _top_cell(lib, cellname):
-    """The cell called cellname, else the first top-level cell."""
-    return cells_by_name(lib).get(cellname) or lib.top_level()[0]
+    """The cell called cellname, else the design cell (gds_geometry_utils.design_cell(): the top-level cell with the
+    largest bounding box, not KLayout's $$$CONTEXT_INFO$$$), as the command-line tools choose it. Up to 1.7 this was
+    the first top-level cell, which depends on the GDS reader's order (gdspy and gdstk differ) and could be
+    $$$CONTEXT_INFO$$$: run_simplify then wrote just that cell. Raises IndexError for a file without cells."""
+    cell = cells_by_name(lib).get(cellname)
+    if cell is not None:
+        return cell
+    try:
+        return design_cell(lib)[0]
+    except ValueError:
+        return lib.top_level()[0]
 
 
 def _flatten_cell(lib, cellname):
@@ -307,7 +316,7 @@ def fill_ground_plane_holes(cell, layers_list, mincount=20, size_tol=1e-3):
 
 def open_gds_cell(gds_path, cellname):
     """Open gds_path with gdstk and resolve the target cell: cellname if
-    given and found, else the file's first top-level cell. Raises on a bad
+    given and found, else the design cell (_top_cell()). Raises on a bad
     file or a library with no top-level cell - callers already wrap their
     own call sites in a broad try/except.
 
