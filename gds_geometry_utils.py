@@ -323,15 +323,13 @@ def compute_bbox(points_list):
 def flatten_subtree_polygons(cell):
     """
     All polygon point arrays reachable from `cell` through references (with
-    their transforms and repetitions applied), without mutating the cell or
-    library: the cell's own polygons (not its paths) and everything its
-    references place, paths included.
+    their transforms and repetitions applied, paths as polygons), without
+    mutating the cell or library. The cell's own paths count too: before,
+    they were left out, and a circuit block whose wiring is drawn as paths
+    (e.g. an amplifier stage with fill along its border) looked hollow and
+    was deleted as a seal ring.
     """
-    points_list = [p.points for p in cell.polygons]
-    for ref in cell.references:
-        if isinstance(ref.cell, gdstk.Cell):
-            points_list.extend(p.points for p in ref.get_polygons(include_paths=True))
-    return points_list
+    return [p.points for p in cell.get_polygons(include_paths=True)]
 
 
 def is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold=0.5,
