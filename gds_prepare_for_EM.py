@@ -357,10 +357,14 @@ def _merge_via_group(via_polygons, maxspacing):
   Returns a list of shapely Polygons.
   """
   offset = maxspacing/2 + 0.01
-  grown = gdstk.offset([np.asarray(p) for p in via_polygons], offset, join='miter', tolerance=2, precision=0.001)
-  # as gdspy's boolean(max_points=199): the merged shapes fractured, then each piece shrunk on its own
-  merged = [q for p in gdstk.boolean(grown, [], "or") for q in p.fracture(max_points=199)]
-  shrunk = gdstk.offset(merged, -offset, join='miter', tolerance=2, precision=0.001)
+  # use_union, and no fracturing before the shrink: a merged shape with holes is a keyhole polygon (a zero-width
+  # slit from the outline to each hole), and a fractured shape is pieces with shared edges. Shrunk on its own, a
+  # slit widens and a shared edge opens, each cutting a strip out of the via. Joined first, a slit is a hole again
+  # and the pieces are one shape.
+  grown = gdstk.offset([np.asarray(p) for p in via_polygons], offset, join='miter', tolerance=2, precision=0.001,
+                       use_union=True)
+  merged = gdstk.boolean(grown, [], "or")
+  shrunk = gdstk.offset(merged, -offset, join='miter', tolerance=2, precision=0.001, use_union=True)
   if not shrunk:
     return []
   # fracture: a merged shape with holes is a keyhole ring, which shapely can't read as one polygon
