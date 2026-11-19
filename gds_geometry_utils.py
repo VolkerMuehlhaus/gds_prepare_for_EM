@@ -43,6 +43,7 @@ from collections import defaultdict
 
 import gdstk
 import numpy as np
+import shapely
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid, explain_validity
@@ -324,6 +325,240 @@ class Progress:
         """A last line if any progress line was printed (so the count ends at the total)."""
         if self.last != self.start:
             print(f"  ... {self.count}/{self.total} {self.what}, {time.monotonic() - self.start:.0f} s", flush=True)
+
+
+def _reference_matrix(ref):
+    """3x3 affine matrix of a gdstk Reference without its origin and repetition: x reflection first, then
+    magnification and rotation (gdstk's order)."""
+    c, s = math.cos(ref.rotation) * ref.magnification, math.sin(ref.rotation) * ref.magnification
+    rotate = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return rotate @ np.diag([1.0, -1.0 if ref.x_reflection else 1.0, 1.0])
+
+
+def cell_placements(top):
+    """{cell name: (n, 3, 3) array}: the affine matrices that place each cell of top's hierarchy (top included,
+    as the identity) in top's coordinates, one per placement, repetitions resolved."""
+    found = defaultdict(list)
+
+    def walk(cell, matrix):
+        found[cell.name].append(matrix)
+        for ref in cell.references:
+            if not isinstance(ref.cell, gdstk.Cell):
+                continue                       # unresolved reference (cell missing from the file)
+            base = _reference_matrix(ref)
+            rep = ref.repetition
+            offsets = rep.get_offsets() if rep is not None and rep.size > 0 else np.zeros((1, 2))
+            for offset in offsets:
+                shift = np.eye(3)
+                shift[:2, 2] = np.asarray(ref.origin) + offset
+                walk(ref.cell, matrix @ shift @ base)
+
+    walk(top, np.eye(3))
+    return {name: np.array(matrices) for name, matrices in found.items()}
+
+
+class DesignMetal:
+    """The flattened metal of a design per layer (purposes in exclude_purposes left out), for "is there metal
+    inside this hole?" tests in design coordinates. A layer is flattened and indexed on its first use."""
+
+    def __init__(self, design, exclude_purposes=()):
+        self.design = design
+        self.exclude = set(exclude_purposes)
+        self.placements = cell_placements(design)
+        self._trees = {}
+        self._by_layer = None
+        self._own = {}
+
+    def _tree(self, layer):
+        self.snapshot()                          # flattened once (gdstk filters only by layer and datatype)
+        if layer not in self._trees:
+            geoms = _shapely_from_gdstk(self._by_layer.get(layer, []))
+            self._trees[layer] = shapely.STRtree(geoms), geoms
+        return self._trees[layer]
+
+    def snapshot(self):
+        """Flatten the design now, before it gets modified (the test then sees the design as it was read)."""
+        if self._by_layer is None:
+            self._by_layer = defaultdict(list)
+            for p in self.design.get_polygons(include_paths=True):
+                if p.datatype not in self.exclude and p.size >= 3:
+                    self._by_layer[p.layer].append(p)
+
+    def remember(self, cell):
+        """Flatten cell's own metal now, before the design gets modified (see snapshot())."""
+        if cell is not self.design and cell.name not in self._own:
+            by_layer = defaultdict(list)
+            for p in cell.get_polygons(include_paths=True):
+                if p.datatype not in self.exclude and p.size >= 3:
+                    by_layer[p.layer].append(p)
+            self._own[cell.name] = {"polygons": by_layer, "trees": {}}
+
+    def _own_metal(self, cell, layer):
+        """(shapely geometries, STRtree or None) of cell's own metal on layer, with its subcells, in cell's
+        coordinates; cached per cell (flattened once, in the state the design was read)."""
+        if cell is self.design:
+            tree, geoms = self._tree(layer)
+            return geoms, tree
+        self.remember(cell)
+        own = self._own[cell.name]
+        if layer not in own["trees"]:
+            geoms = _shapely_from_gdstk(own["polygons"].get(layer, []))
+            own["trees"][layer] = (geoms, shapely.STRtree(geoms) if len(geoms) else None)
+        return own["trees"][layer]
+
+    @staticmethod
+    def _island_area(pieces, hole, min_area):
+        """Area of the metal islands in hole: pieces (shapely geometries: the polygon around the hole and all metal
+        reaching into it) merged, the parts that lie inside the hole. Metal that touches the polygon around the
+        hole merges with it, it is connected (filling the hole shorts nothing)."""
+        if len(pieces) == 0:
+            return 0.0
+        # clipped to the hole's box first (a large ground plane has thousands of vertices): metal crossing the
+        # hole's edge touches the polygon around it right there, inside the box, so islands stay islands
+        (x0, y0, x1, y1) = hole.bounds
+        window = shapely.box(x0 - 1e-3, y0 - 1e-3, x1 + 1e-3, y1 + 1e-3)
+        clipped = shapely.intersection(shapely.make_valid(np.asarray(pieces, dtype=object)), window)
+        merged = shapely.union_all(clipped)
+        inside = hole.buffer(1e-6)
+        return sum(part.area for part in getattr(merged, "geoms", [merged])
+                   if part.area > min_area and part.within(inside))
+
+    def metal_inside(self, cell, layer, holes, min_area=1e-6):
+        """For each hole (shapely Polygon in cell's coordinates) of a polygon of cell on layer: "none", "own" or
+        "foreign", by the metal islands of layer inside it (metal not connected to the polygon around the hole).
+        "own": islands, all from cell itself (with its subcells), e.g. a fill square in the opening of a grid
+        tile. "foreign": at some placement of the cell, more island area lies inside than the cell brings itself:
+        a circuit or a pad in a ground plane's clearance."""
+        matrices = self.placements.get(cell.name)
+        if matrices is None or not holes:
+            return ["none"] * len(holes)
+        tree, geoms = self._tree(layer)
+        own, own_tree = self._own_metal(cell, layer)
+        result = []
+        for hole in holes:
+            own_area = 0.0
+            if own_tree is not None:
+                own_area = self._island_area(own[own_tree.query(hole, predicate="intersects")], hole, min_area)
+            if cell is self.design:
+                # the design itself: its own metal is all metal there is, islands are the design's own
+                result.append("own" if own_area > min_area else "none")
+                continue
+            ring = np.asarray(hole.exterior.coords)                    # (k, 2), closed
+            placed = np.einsum("pij,kj->pki", matrices, np.hstack([ring, np.ones((len(ring), 1))]))[:, :, :2]
+            placed_holes = shapely.polygons(placed)
+            hole_idx, metal_idx = tree.query(placed_holes, predicate="intersects")
+            design_area = 0.0
+            for k in np.unique(hole_idx):
+                area = self._island_area(geoms[metal_idx[hole_idx == k]], placed_holes[k], min_area)
+                design_area = max(design_area, area)
+                if design_area > own_area + min_area:
+                    break
+            if design_area > own_area + min_area:
+                result.append("foreign")
+            elif own_area > min_area:
+                result.append("own")
+            else:
+                result.append("none")
+        return result
+
+
+SMALL_HOLE_AREA = 25.0   # um^2: empty holes up to this size are filled, larger ones only if their size repeats
+
+
+class CutoutFiller:
+    """Which holes of polygons are density-fill cutouts, to fill (gds_prepare_for_EM STEP 1, gds_simplify).
+
+    A ground plane's clearance around a circuit is a hole too, and so is a one-off opening under a pad; filling
+    them covered the circuit with metal or added metal under pads. A hole is filled only if
+    - no metal island of the same layer from elsewhere in the design lies inside it, at any placement of its cell
+      (purposes in exclude_purposes don't count; metal touching the polygon around the hole is connected to it,
+      no island);
+    - islands of the polygon's own cell inside it (a fill square in the opening of a grid tile) only if that cell
+      is placed at least repeat_count times (a fill tile, not a design drawn in one cell);
+    - an empty hole only if it is at most small_hole_area (um^2), or its size (bounding box) occurs at least
+      repeat_count times on the layer, counting each placement of a cell (density fill, mesh ground planes);
+    - with max_hole_area given, only if it is at most max_hole_area (um^2).
+
+    is_candidate(poly): which polygons to look at (layers, purposes). Built before the library is modified: the
+    tests see the design as read.
+    """
+
+    def __init__(self, library, design, is_candidate, exclude_purposes=(), small_hole_area=SMALL_HOLE_AREA,
+                 repeat_count=20, max_hole_area=None):
+        self.small_hole_area, self.repeat_count, self.max_hole_area = small_hole_area, repeat_count, max_hole_area
+        self.metal = DesignMetal(design, exclude_purposes)
+        self.decomposed = {}
+        self.size_count = defaultdict(int)
+        for cell in library.cells:
+            placed = len(self.metal.placements.get(cell.name, ()))
+            for n, poly in enumerate(cell.polygons):
+                if is_candidate(poly):
+                    decomp = decompose_polygon_holes(poly.points)
+                    if decomp is not None:
+                        self.decomposed[(cell.name, n)] = decomp
+                        for hole in decomp["holes"]:
+                            self.size_count[(poly.layer, self._size_key(hole))] += placed
+        if self.decomposed:
+            self.metal.snapshot()
+            by_name = {c.name: c for c in library.cells}
+            for name in {name for name, _ in self.decomposed}:
+                self.metal.remember(by_name[name])
+
+    @staticmethod
+    def _size_key(hole):
+        (x0, y0, x1, y1) = hole.bounds
+        return tuple(sorted((round(x1 - x0, 3), round(y1 - y0, 3))))   # sorted: a rotated placement counts too
+
+    def holes(self, cell, n):
+        """decompose_polygon_holes() of polygon n of cell, None if it has no holes (or is no candidate)."""
+        return self.decomposed.get((cell.name, n))
+
+    def replacement(self, cell, n, poly):
+        """(polygons, message) for polygon n of cell (it has holes): its solid outline if all holes are filled,
+        valid geometry with the holes kept otherwise; polygons None: leave it as it is (no valid geometry found)."""
+        decomp = self.decomposed[(cell.name, n)]
+        holes = decomp["holes"]
+        placed = len(self.metal.placements.get(cell.name, ()))
+        inside = self.metal.metal_inside(cell, poly.layer, holes)
+        kept, reasons = [], defaultdict(int)
+        for hole, what in zip(holes, inside):
+            if self.max_hole_area is not None and hole.area > self.max_hole_area:
+                why = "larger than max_hole_area"
+            elif what == "foreign":
+                why = "with circuit metal inside"
+            elif what == "own":
+                why = None if placed >= self.repeat_count else "with metal inside"
+            elif hole.area <= self.small_hole_area or \
+                    self.size_count[(poly.layer, self._size_key(hole))] >= self.repeat_count:
+                why = None
+            else:
+                why = "large and not repeated"
+            if why:
+                kept.append(hole)
+                reasons[why] += 1
+        where = f"{cell.name} polygon #{n} layer {poly.layer}"
+        if not kept:
+            return ([gdstk.Polygon(decomp["exterior_coords"], layer=poly.layer, datatype=poly.datatype)],
+                    f"{where}: cutout filled")
+        # holes kept: re-emitted as valid geometry (a keyhole polygon is not valid for a solid-body mesher like
+        # gds2palace), with the filled holes closed
+        reason = ", ".join(f"{count} {why}" for why, count in reasons.items())
+        fixed = cut_holes_as_valid_polygons(decomp["exterior_coords"], kept, poly.layer, poly.datatype)
+        if fixed is None:
+            return None, (f"{where}: WARNING: could not re-encode it with its holes ({reason}) as valid geometry, "
+                          "left as it is")
+        return fixed, f"{where}: keeping {len(kept)} of {len(holes)} holes ({reason}), re-encoded as valid geometry"
+
+
+def _shapely_from_gdstk(polygons):
+    """numpy object array of shapely Polygons of gdstk Polygons (vectorized per vertex count)."""
+    out = np.empty(len(polygons), dtype=object)
+    by_count = defaultdict(list)
+    for i, p in enumerate(polygons):
+        by_count[p.size].append(i)
+    for _, indices in by_count.items():
+        out[indices] = shapely.polygons(np.stack([polygons[i].points for i in indices]))
+    return out
 
 
 def compute_bbox(points_list):

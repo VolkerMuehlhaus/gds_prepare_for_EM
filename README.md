@@ -9,6 +9,7 @@ Large layouts with millions of fill vias, such as a full chip with its pad frame
 Results change in three places. Simulations of a layout prepared with 1.8 are not directly comparable with ones prepared with 1.7:
 - **Merged vias are complete.** Before, shrinking a merged via back after merging cut strips of up to about 2 µm out of it, along the slit that encodes a hole and along fracture lines. Rings of vias came out cut open. Merged via area typically goes up by 0.5 to 10%, and by up to 25% on large via fields.
 - **Circuit blocks are no longer deleted as seal rings** when their wiring is drawn as paths and only fill sits along their border.
+- **Holes are filled only if they are density-fill cutouts.** Before, every hole in a metal polygon was filled: a ground plane's clearance around a circuit became solid metal covering the circuit (TopMetal2 of a PA became one rectangle), as did openings under pads and around inductors. Now a hole with a metal island inside, or a large one-off opening, is kept. Metal area goes down where such holes were filled before.
 - **Without `--cell`, setupEM's Simplify GDS and the gds2palace MCP server take the design cell**, the same one the command-line tools take: the largest top-level cell, never KLayout's `$$$CONTEXT_INFO$$$`. Before, they took the first top-level cell, and for some KLayout files the output contained only `$$$CONTEXT_INFO$$$`.
 
 `open_gds_cell()` in gds_simplify_for_em now returns gdstk objects. setupEM and gds2palace_mcp need versions that support this.
@@ -47,7 +48,7 @@ python gds_removefill.py layout.gds cleaned_layout.gds --minsize 1 --maxsize 40 
 ```
 
 ## gds_simplify
-Replaces density-fill cutouts (squares/shapes with a hole punched in them) with solid outlines, replaces circle-like pads with octagons for faster meshing, and detects and removes thin ring/frame structures on the layout periphery such as seal rings. Always processes the full built-in default set of layers.
+Replaces density-fill cutouts (squares/shapes with a hole punched in them) with solid outlines (the same rule as gds_prepare_for_EM: not a ground plane's clearance around a circuit, not a one-off opening under a pad), replaces circle-like pads with octagons for faster meshing, and detects and removes thin ring/frame structures on the layout periphery such as seal rings. Always processes the full built-in default set of layers.
 
 Optional commandline parameters, and their default value if not given:
 - `--exclude-layers` - none (the full built-in default layer set is processed)
@@ -68,7 +69,7 @@ Optional commandline parameters, and their default value if not given:
 - `--fill-minsize` - `1` (micron)
 - `--fill-maxsize` - no upper limit
 - `--fill-mincount` - `20` (how many repeats of the same size count as fill, or as a hole pattern to fill)
-- `--max-hole-area` - no upper limit (every real cutout found is filled); set this to leave larger cutouts untouched
+- `--max-hole-area` - no upper limit; set this to leave larger holes untouched. Independent of it, a hole is filled only if it is a density-fill cutout: no metal island of the same layer inside it (a ground plane's clearance around a circuit or a pad stays), and at most 25 µm² or of a size that repeats `--fill-mincount` times on the layer (a one-off opening under a pad stays). A fill tile placed `--fill-mincount` times or more is filled with its own fill square inside
 - `--via-merge-size` - `2` (micron): vias closer than this are merged into one shape, but only if they connect the same metal shapes above and below, so via merging never shorts different metal shapes. The merged shape is clipped to the overlap of these metal shapes. `0` = no via merging.
 
 ```

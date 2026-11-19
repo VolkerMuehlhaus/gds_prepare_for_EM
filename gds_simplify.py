@@ -36,7 +36,7 @@ import sys
 import gdstk
 
 from gds_geometry_utils import (
-    decompose_polygon_holes,
+    CutoutFiller,
     is_circle_like,
     simplify_round_polygon_to_octagon,
     is_ring_candidate,
@@ -107,6 +107,14 @@ delete_purpose_list = [
   2 # pin
 ]
 
+# purposes that are no metal for the "is there metal inside this hole?" test (as gds_prepare_for_EM)
+NOT_METAL_PURPOSES = [
+  28, # noqrc
+  22, # filler
+  23, # nofill
+  21  # block
+]
+
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
 # instead of replaced by a solid shape (see detect_and_delete_periphery_rings
@@ -158,6 +166,11 @@ def main():
   top_cell_name = design.name
   design_bbox = design.bounding_box()
 
+  # which holes are fill cutouts: decided on the design as read, before anything is changed
+  def is_candidate(poly):
+    return (poly.layer in layers_list or poly.layer > 200) and poly.datatype in required_purpose_list
+  filler = CutoutFiller(output_library, design, is_candidate, NOT_METAL_PURPOSES)
+
   # iterate over cells
   for cell in output_library.cells:
     print('cellname = ' + str(cell.name))
@@ -178,7 +191,7 @@ def main():
       if ((poly_layer in layers_list or poly_layer>200) and (poly_purpose in required_purpose_list)):
         # Polygon of interest, check if we need to process this
 
-        decomp = decompose_polygon_holes(polypoints)
+        decomp = filler.holes(cell, n)
 
         if decomp is not None:
           is_thin_ring = (
@@ -191,10 +204,13 @@ def main():
             print('   Deleting periphery ring polygon #', str(n), ' layer ', str(poly_layer))
             remove.append(poly)
           else:
-            print('   Replacing cutout polygon #', str(n), ' layer ', str(poly_layer))
-            # Replace it with a solid version of the exterior outline
-            remove.append(poly)
-            add.append(gdstk.Polygon(decomp["exterior_coords"], layer=poly_layer, datatype=poly_purpose))
+            # a density-fill cutout is filled, a ground plane's clearance around a circuit or a one-off opening
+            # under a pad is kept (see CutoutFiller)
+            polygons, message = filler.replacement(cell, n, poly)
+            print('   ' + message)
+            if polygons is not None:
+              remove.append(poly)
+              add.extend(polygons)
 
         # now do the check for circle-like structures (only if not already handled as a hole/ring above)
         elif len(polypoints) > 11 and is_circle_like(polypoints):

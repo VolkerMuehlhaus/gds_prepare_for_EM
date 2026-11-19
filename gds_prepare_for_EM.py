@@ -33,12 +33,10 @@ from shapely.ops import unary_union
 from shapely.validation import make_valid
 
 from gds_geometry_utils import (
-    decompose_polygon_holes,
     is_circle_like,
     simplify_round_polygon_to_octagon,
     is_ring_candidate,
     detect_and_delete_periphery_rings,
-    cut_holes_as_valid_polygons,
     validate_and_repair_polygons,
     design_cell,
     only_cell,
@@ -46,6 +44,8 @@ from gds_geometry_utils import (
     cell_layers,
     flat_polygon_cell,
     Progress,
+    CutoutFiller,
+    SMALL_HOLE_AREA,
 )
 
 __version__ = "1.8.0"
@@ -691,14 +691,24 @@ def merge_via_arrays_in_cell (input_cell, layers_list, maxspacing=DEFAULT_VIA_ME
 # Helper functions for cutout removal
 # ----------------------------------------------
 
-def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_hole_area=None):
+def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_hole_area=None, design=None,
+                                  small_hole_area=SMALL_HOLE_AREA, repeat_count=20):
   """
-  max_hole_area: if given, only cutouts whose total hole area is <=
-  max_hole_area get filled in (replaced by a solid outline) - larger holes
-  are left untouched. Leave as None (default) to fill every real cutout
-  found, regardless of size, matching the original behavior. This only
-  gates the "genuine cutout" branch, not thin-ring detection/deletion.
+  Fill density-fill cutouts (a fill shape with a hole punched in it) in the
+  hierarchical design, and delete thin rings on the design periphery. Which
+  holes are filled: see gds_geometry_utils.CutoutFiller (not a ground plane's
+  clearance around a circuit, not a one-off opening under a pad). A polygon
+  whose holes are all filled becomes its solid outline, one with holes kept
+  is re-encoded as valid geometry.
+
+  design: the design cell (default: the design cell of the library, see
+  design_cell()).
   """
+  if design is None:
+    design, _ = design_cell(library)
+  filler = CutoutFiller(library, design, lambda poly: poly.layer in layers_list, exclude_purpose_list,
+                        small_hole_area=small_hole_area, repeat_count=repeat_count, max_hole_area=max_hole_area)
+
   # iterate over cells
   progress = Progress(len(library.cells), "cells")
   for cell in library.cells:
@@ -707,59 +717,25 @@ def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_ho
     # removing polygon by polygon scanned the whole cell each time
     remove, add = [], []
 
-    # iterate over polygons
+    # iterate over polygons with holes (dummy fill with cutout, or thin rings)
     for n,poly in enumerate(cell.polygons):
-      # points of this polygon
-      polypoints = poly.points
-
-      poly_layer = poly.layer
-      poly_purpose = poly.datatype
-
-
-      # -------- Check for polygons with holes (dummy fill with cutout, or thin rings) ---------
-      if (poly_layer in layers_list):
-        # Polygon of interest, check if we need to process this
-
-        decomp = decompose_polygon_holes(polypoints)
-        if decomp is not None:
-          is_thin_ring = (
-            decomp["hole_area_fraction"] >= RING_HOLE_FRACTION_THRESHOLD
-            and design_bbox is not None
-            and is_ring_candidate(poly.bounding_box(), design_bbox)
-          )
-
-          if is_thin_ring:
-            print(cell.name, ' deleting periphery ring polygon #', str(n), 'layer', str(poly_layer))
-            remove.append(poly)
-          elif max_hole_area is not None and sum(h.area for h in decomp["holes"]) > max_hole_area:
-            # cutout is larger than the requested threshold - keep the hole (don't
-            # fill it in), but the original polygon's raw "bridge" hole encoding is
-            # not guaranteed to be geometrically valid (a solid-body mesher like
-            # gds2palace can choke on it) even though max_hole_area only ever meant
-            # to gate whether the hole gets FILLED, not whether the polygon is
-            # valid - so re-emit it as clean, hole-preserving geometry instead of
-            # leaving the original untouched.
-            hole_area = sum(h.area for h in decomp["holes"])
-            fixed = cut_holes_as_valid_polygons(decomp["exterior_coords"], decomp["holes"],
-                                                 poly_layer, poly_purpose)
-            if fixed is not None:
-              print(cell.name, ' re-encoding oversized cutout polygon #', str(n), 'layer', str(poly_layer),
-                    ' as valid geometry (hole area', f'{hole_area:.2f}', 'kept, not filled)')
-              remove.append(poly)
-              add.extend(fixed)
-            else:
-              # couldn't find a fracture that validates - fall back to leaving the
-              # original alone rather than silently discarding/guessing, but say so
-              print(cell.name, ' WARNING: could not re-encode oversized cutout polygon #', str(n),
-                    'layer', str(poly_layer), 'as valid geometry - leaving original as-is '
-                    '(hole area', f'{hole_area:.2f}', 'exceeds max_hole_area', max_hole_area, ')')
-          else:
-            # We can be sure we have a dummy shape with cutout.
-            print(cell.name, ' replacing cutout polygon #', str(n), 'layer', str(poly_layer))
-
-            # Replace it with a solid version of the exterior outline
-            remove.append(poly)
-            add.append(gdstk.Polygon(decomp["exterior_coords"], layer=poly_layer, datatype=poly_purpose))
+      decomp = filler.holes(cell, n)
+      if decomp is None:
+        continue
+      is_thin_ring = (
+        decomp["hole_area_fraction"] >= RING_HOLE_FRACTION_THRESHOLD
+        and design_bbox is not None
+        and is_ring_candidate(poly.bounding_box(), design_bbox)
+      )
+      if is_thin_ring:
+        print(cell.name, ' deleting periphery ring polygon #', str(n), 'layer', str(poly.layer))
+        remove.append(poly)
+        continue
+      polygons, message = filler.replacement(cell, n, poly)
+      print(message)
+      if polygons is not None:
+        remove.append(poly)
+        add.extend(polygons)
     if remove:
       cell.remove(*remove)
     if add:
@@ -867,8 +843,12 @@ def main():
                          help="the design cell (default: the top-level cell with the largest bounding box, "
                               "not KLayout's $$$CONTEXT_INFO$$$)")
     parser.add_argument("--max-hole-area", type=float, default=None,
-                         help="maximum cutout area (microns squared) to fill in - larger cutouts are left "
-                              "untouched (default: no limit - every real cutout found is filled)")
+                         help="maximum area (microns squared) of a hole to fill in (STEP 1 and 5b) - larger "
+                              "holes are left untouched (default: no limit). Independent of it, STEP 1 fills "
+                              "a hole only if no metal of the same layer lies inside it (a ground plane's "
+                              f"clearance around a circuit), and only if it is at most {SMALL_HOLE_AREA:g} um2 "
+                              "or its size repeats --fill-mincount times on the layer (density fill, mesh "
+                              "ground planes; not a one-off opening such as a ground plane opening under a pad)")
     args = parser.parse_args()
     print_run_config(parser, args)
 
@@ -897,10 +877,12 @@ def main():
 
     # STEP 1: remove cutouts in the hierachical design, don't flatten at this stage
     # do this on metal layers (not via layers, not EM port layers)
-    hole_area_desc = f'<= {args.max_hole_area}' if args.max_hole_area is not None else 'any size'
-    steps.next(f"\nSTEP 1: remove cutouts in the hierachical design ({hole_area_desc}), don't flatten at this stage")
+    hole_area_desc = f', at most {args.max_hole_area} um2' if args.max_hole_area is not None else ''
+    steps.next(f"\nSTEP 1: remove cutouts in the hierachical design (holes without metal inside, <= {SMALL_HOLE_AREA:g} um2 "
+               f"or repeating >= {args.fill_mincount} times{hole_area_desc}), don't flatten at this stage")
     lib = remove_cutout_keep_hierarchy (lib, metal_layers_list, design_bbox=design_bbox,
-                                         max_hole_area=args.max_hole_area)
+                                         max_hole_area=args.max_hole_area, design=design,
+                                         repeat_count=args.fill_mincount)
 
     # STEP 2: detect and delete thin ring/frame structures on the periphery
     # (e.g. seal rings). This has to run before via array merging, since it

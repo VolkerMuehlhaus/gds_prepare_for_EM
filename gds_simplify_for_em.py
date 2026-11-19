@@ -152,7 +152,8 @@ def run_simplify(gds_path, metal_layers, output_path, cellname="",
     if do_cutouts:
         design_bbox = top_cell.bounding_box()
         lib = remove_cutout_keep_hierarchy(lib, metal_layers, design_bbox=design_bbox,
-                                            max_hole_area=max_hole_area)
+                                            max_hole_area=max_hole_area, design=top_cell,
+                                            repeat_count=fill_mincount)
         top_cell = _top_cell(lib, cellname)
 
     # floating-fill removal already ends with a flattened, per-layer-merged
