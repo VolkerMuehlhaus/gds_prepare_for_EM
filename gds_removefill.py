@@ -21,14 +21,14 @@
 
 import argparse
 import sys
-import gdspy
+import gdstk
 from collections import defaultdict
 from rtree import index  # pip install rtree
 import numpy as np
 
-from gds_geometry_utils import design_cell
+from gds_geometry_utils import design_cell, polygons_by_spec
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 
 # Layer number <-> name mapping. To adapt this tool to a different
@@ -61,13 +61,13 @@ via_layers_list = [NAME_TO_LAYER[name] for name in VIA_LAYER_NAMES]
 # --------------------------
 
 def create_polygon(points, layer=0, datatype=0, decimals=9):
-    """Create a gdspy.Polygon with coordinates rounded to avoid floating-point issues."""
+    """Create a gdstk.Polygon with coordinates rounded to avoid floating-point issues."""
     rounded = np.round(points, decimals)
-    return gdspy.Polygon(rounded,layer=layer,datatype=datatype)
+    return gdstk.Polygon(rounded, layer=layer, datatype=datatype)
 
 def bbox_size(poly, tol=1e-6):
     """Return width and height of polygon bounding box rounded to tolerance."""
-    (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
+    (xmin, ymin), (xmax, ymax) = poly.bounding_box()
     w = round((xmax - xmin) / tol) * tol
     h = round((ymax - ymin) / tol) * tol
     return (w, h)
@@ -88,18 +88,18 @@ def touches_any(poly, rtree_idx, all_polys, precision=1e-5):
     isolation test here only ever has to ask "does this (already-merged)
     shape touch anything else" - which is unambiguous.
     """
-    (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
+    (xmin, ymin), (xmax, ymax) = poly.bounding_box()
 
-    candidate_ids = list(rtree_idx.intersection((xmin, ymin, xmax, ymax)))
+    candidates = [all_polys[cid] for cid in rtree_idx.intersection((xmin, ymin, xmax, ymax))]
+    candidates = [other for other in candidates if other is not poly]
+    if not candidates:
+        return False  # isolated, nothing near it
 
     # oversize for a small overlap with possible neighbors
     offset = 0.01
-    oversizepoly=gdspy.offset(poly, offset, join='miter', tolerance=2, precision=0.001, join_first=True, max_points=1999)
-    for cid in candidate_ids:
-        other = all_polys[cid]
-        if other is poly:
-            continue
-        if gdspy.boolean(oversizepoly, other, 'and', precision=precision) is not None:
+    oversizepoly = gdstk.offset(poly, offset, join='miter', tolerance=2, precision=0.001, use_union=True)
+    for other in candidates:
+        if gdstk.boolean(oversizepoly, other, 'and', precision=precision):
             return True  # touches another polygon
     return False  # isolated
 
@@ -107,13 +107,15 @@ def touches_any(poly, rtree_idx, all_polys, precision=1e-5):
 def merge_polygons(polygons):
     """Merge (boolean OR) a list of LPPpolylist-style polygons, return the merged point-arrays. As
     gds_prepare_for_EM.merge_polygons: a single polygon is returned as it is, and an empty union (degenerate input,
-    e.g. an EM port marker drawn as a zero-width sliver) keeps the original polygons instead of crashing."""
+    e.g. an EM port marker drawn as a zero-width sliver) keeps the original polygons instead of dropping them.
+    Merged shapes over 999 vertices are fractured into several polygons."""
+    polygons = [np.asarray(p) for p in polygons]
     if len(polygons) <= 1:
-        return list(polygons)
-    mergedpolygonset = gdspy.boolean(polygons, None, "or", max_points=999)
-    if mergedpolygonset is None:
-        return list(polygons)
-    return mergedpolygonset.polygons
+        return polygons
+    merged = gdstk.boolean(polygons, [], "or")
+    if not merged:
+        return polygons
+    return [q.points for p in merged for q in p.fracture(max_points=999)]
 
 
 def merge_polygons_by_layer(cell):
@@ -122,16 +124,15 @@ def merge_polygons_by_layer(cell):
     a flat cell into the minimal set of merged polygons. Must run before
     find_isolated_same_size_polygons_by_layer(), see touches_any() for why.
     """
-    new_lib = gdspy.GdsLibrary()
-    new_cell = gdspy.Cell(cell.name + "_merged_by_layer")
+    new_lib = gdstk.Library()
+    new_cell = gdstk.Cell(cell.name + "_merged_by_layer")
 
-    polys_by_layer = cell.get_polygons(by_spec=True, depth=0)
+    polys_by_layer = polygons_by_spec(cell, depth=0)
     for (layer, datatype), polys in polys_by_layer.items():
         if not polys:
             continue
         merged_points = merge_polygons(polys)
-        for pts in merged_points:
-            new_cell.add(gdspy.Polygon(pts, layer=layer, datatype=datatype))
+        new_cell.add(*[gdstk.Polygon(pts, layer=layer, datatype=datatype) for pts in merged_points])
 
     new_lib.add(new_cell)
     return new_lib
@@ -160,28 +161,24 @@ def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, 
     Only considers polygons on the same layer for isolation.
     """
     # create new library with new cell to hold polygons that are NOT removed
-    new_lib = gdspy.GdsLibrary()
-    new_cell = gdspy.Cell(cell.name + "_cleaned")
+    new_lib = gdstk.Library()
+    new_cell = gdstk.Cell(cell.name + "_cleaned")
 
-    # Flatten hierarchy
-    flat = cell.flatten()
-
-    # Get polygons grouped by layer
-    polys_by_layer = flat.get_polygons(by_spec=True)  # returns dict {(layer, datatype): [polys]}
+    # Get polygons grouped by layer, hierarchy flattened
+    polys_by_layer = polygons_by_spec(cell)  # {(layer, datatype): [point arrays]}
     isolated_per_layer = defaultdict(dict)
 
     for (layer, datatype), polys_raw in polys_by_layer.items():
         if len(polys_raw) == 0:
             continue
 
-        # Convert to gdspy.Polygon and remove exact duplicates (including layer and datatype)
+        # Convert to gdstk.Polygon and remove exact duplicates (including layer and datatype)
         raw_polys = [create_polygon(p, layer, datatype) for p in polys_raw]
         seen = set()
         all_polys = []
 
         for poly in raw_polys:
-            a = poly
-            pts = poly.polygons[0]
+            pts = poly.points
             if pts is None or pts.size == 0:
                 continue
             # Hashable signature includes points, layer, and datatype
@@ -201,7 +198,7 @@ def find_isolated_same_size_polygons_by_layer(cell, via_layers_list, minsize=1, 
             # that passes the cheap pre-filters below
             rtree_idx = index.Index()
             for i, poly in enumerate(all_polys):
-                (xmin, ymin), (xmax, ymax) = poly.get_bounding_box()
+                (xmin, ymin), (xmax, ymax) = poly.bounding_box()
                 rtree_idx.insert(i, (xmin, ymin, xmax, ymax))
 
             isolated = {}
@@ -291,25 +288,28 @@ def main():
 
     print ("Input file: ", input_name)
 
-    lib = gdspy.GdsLibrary()
-    lib.read_gds(input_name)
+    lib = gdstk.read_gds(input_name)
     try:
         top, others = design_cell(lib, args.cell)       # the first top-level cell can be another one
     except ValueError as e:
         sys.exit(f"ERROR: {e}")
     print(f"Cell: {top.name}" + (f" (other top-level cells, left out: {', '.join(others)}; choose another one "
                                  "with --cell)" if others else ""))
-    top.flatten()
-
     # merge touching same-layer polygons first - see touches_any() for why
-    # this has to happen before the isolation test
-    merged_lib = merge_polygons_by_layer(top)
+    # this has to happen before the isolation test. The design's hierarchy
+    # is flattened into a new cell (paths as polygons).
+    flat = gdstk.Cell(top.name)
+    flat.add(*top.get_polygons(include_paths=True))
+    merged_lib = merge_polygons_by_layer(flat)
     merged_top = merged_lib.top_level()[0]
 
     new_lib = find_isolated_same_size_polygons_by_layer(
         merged_top, via_layers_list, minsize=args.minsize, maxsize=args.maxsize, mincount=args.mincount
     )
-    new_lib.write_gds(output_name)
+    # in the unit of the input file; max_points: gdstk would otherwise
+    # fracture every polygon over 199 vertices on writing, gdspy didn't
+    new_lib.unit, new_lib.precision = lib.unit, lib.precision
+    new_lib.write_gds(output_name, max_points=8190)
 
     print('\n\nFINISHED: Created output file ', output_name)
 

@@ -1,7 +1,7 @@
 # The design cell of a file with several top-level cells: the largest one (never KLayout's $$$CONTEXT_INFO$$$), or
 # the one given with --cell. All three command-line tools took the first top-level cell before.
 
-import gdspy
+import gdstk
 import pytest
 
 from conftest import design_summary, run_tool, top_cell_names, write_gds
@@ -19,14 +19,14 @@ def layout(tmp_path):
 
 
 def test_design_cell(layout):
-    lib = gdspy.GdsLibrary(infile=layout)
+    lib = gdstk.read_gds(layout)
     cell, others = design_cell(lib)
     assert cell.name == "DESIGN" and sorted(others) == ["small_device"]
     assert design_cell(lib, "small_device")[0].name == "small_device"
     with pytest.raises(ValueError, match="no cell nope"):
         design_cell(lib, "nope")
     alone = only_cell(lib, cell)
-    assert sorted(c.name for c in alone.cells.values()) == ["DESIGN", "DEVICE"]
+    assert sorted(c.name for c in alone.cells) == ["DESIGN", "DEVICE"]
 
 
 def test_prepare_takes_the_design_cell(layout, tmp_path):
@@ -51,3 +51,16 @@ def test_removefill_and_simplify_take_the_design_cell(layout, tmp_path):
     assert "Cell: DESIGN" in result.stdout and (126, 0) in design_summary(tmp_path / "out.gds")
     result = run_tool("gds_simplify", layout, cwd=tmp_path)
     assert result.returncode == 0 and "Cell: DESIGN" in result.stdout
+
+
+def test_run_simplify_and_open_gds_cell_take_the_design_cell(layout, tmp_path):
+    """Without a cell name: the design cell, not the first top-level cell ($$$CONTEXT_INFO$$$ in this file). Before,
+    run_simplify wrote only $$$CONTEXT_INFO$$$ for a KLayout file."""
+    from gds_simplify_for_em import open_gds_cell, run_simplify
+
+    assert [c.name for c in gdstk.read_gds(layout).top_level()][0] != "DESIGN"
+    assert open_gds_cell(layout, "")[1].name == "DESIGN"
+    assert open_gds_cell(layout, "small_device")[1].name == "small_device"
+    out = tmp_path / "out.gds"
+    run_simplify(layout, [8, 126], str(out), do_merge=True)
+    assert (126, 0) in design_summary(out), "the design's TopMetal1"

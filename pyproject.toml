@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gds_prepare_for_EM"
-version = "1.7.2"
+version = "1.8.0"
 description = "Simplify IHP SG13G2 GDSII layouts for EM simulation (Palace, openEMS)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
 dependencies = [
-    "gdspy",
+    "gdstk",
     "rtree",
     "numpy",
     "shapely>=2.0",

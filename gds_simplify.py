@@ -33,10 +33,10 @@
 import argparse
 import sys
 
-import gdspy
+import gdstk
 
 from gds_geometry_utils import (
-    decompose_polygon_holes,
+    CutoutFiller,
     is_circle_like,
     simplify_round_polygon_to_octagon,
     is_ring_candidate,
@@ -45,7 +45,7 @@ from gds_geometry_utils import (
     design_cell,
 )
 
-__version__ = "1.3"
+__version__ = "1.4"
 
 
 # ==================== settings =========================
@@ -107,6 +107,14 @@ delete_purpose_list = [
   2 # pin
 ]
 
+# purposes that are no metal for the "is there metal inside this hole?" test (as gds_prepare_for_EM)
+NOT_METAL_PURPOSES = [
+  28, # noqrc
+  22, # filler
+  23, # nofill
+  21  # block
+]
+
 # a polygon-with-hole where the hole covers this much of the exterior area
 # is treated as a thin ring, not "fill with cutout" - it gets deleted
 # instead of replaced by a solid shape (see detect_and_delete_periphery_rings
@@ -147,7 +155,7 @@ def main():
   output_name = input_name.replace(".gds","_forEM.gds")
 
   # Read GDSII library
-  output_library = gdspy.GdsLibrary(infile=input_name)
+  output_library = gdstk.read_gds(input_name)
 
   # the design cell, for the seal ring detection: the first top-level cell can be another one
   try:
@@ -156,68 +164,70 @@ def main():
     sys.exit(f"ERROR: {e}")
   print(f"Cell: {design.name}")
   top_cell_name = design.name
-  design_bbox = design.get_bounding_box()
+  design_bbox = design.bounding_box()
+
+  # which holes are fill cutouts: decided on the design as read, before anything is changed
+  def is_candidate(poly):
+    return (poly.layer in layers_list or poly.layer > 200) and poly.datatype in required_purpose_list
+  filler = CutoutFiller(output_library, design, is_candidate, NOT_METAL_PURPOSES)
 
   # iterate over cells
-  for cell in output_library:
+  for cell in output_library.cells:
     print('cellname = ' + str(cell.name))
+    # polygons to remove and to add, applied once per cell after the loop:
+    # removing polygon by polygon scanned the whole cell each time
+    remove, add = [], []
 
     # iterate over polygons
     for n,poly in enumerate(cell.polygons):
       # points of this polygon
-      polypoints = poly.polygons[0]
+      polypoints = poly.points
 
-      poly_layer = poly.layers[0]
-      poly_purpose = poly.datatypes[0]
+      poly_layer = poly.layer
+      poly_purpose = poly.datatype
 
 
       # -------- Check for polygons with holes (dummy fill with cutout, or thin rings) ---------
       if ((poly_layer in layers_list or poly_layer>200) and (poly_purpose in required_purpose_list)):
         # Polygon of interest, check if we need to process this
 
-        decomp = decompose_polygon_holes(polypoints)
+        decomp = filler.holes(cell, n)
 
         if decomp is not None:
           is_thin_ring = (
             decomp["hole_area_fraction"] >= RING_HOLE_FRACTION_THRESHOLD
             and design_bbox is not None
-            and is_ring_candidate(poly.get_bounding_box(), design_bbox)
+            and is_ring_candidate(poly.bounding_box(), design_bbox)
           )
 
           if is_thin_ring:
             print('   Deleting periphery ring polygon #', str(n), ' layer ', str(poly_layer))
-            poly.layers=[0]
-            cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
+            remove.append(poly)
           else:
-            print('   Replacing cutout polygon #', str(n), ' layer ', str(poly_layer))
-            # invalidate original polygon
-            poly.layers=[0]
-            # remove original polygon
-            cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
-
-            # Replace it with a solid version of the exterior outline
-            basepoly = gdspy.Polygon(decomp["exterior_coords"], layer=poly_layer, datatype=poly_purpose)
-            cell.add(basepoly)
+            # a density-fill cutout is filled, a ground plane's clearance around a circuit or a one-off opening
+            # under a pad is kept (see CutoutFiller)
+            polygons, message = filler.replacement(cell, n, poly)
+            print('   ' + message)
+            if polygons is not None:
+              remove.append(poly)
+              add.extend(polygons)
 
         # now do the check for circle-like structures (only if not already handled as a hole/ring above)
         elif len(polypoints) > 11 and is_circle_like(polypoints):
           new_points = simplify_round_polygon_to_octagon(polypoints)
-
-          # invalidate original polygon
-          poly.layers=[0]
-          # remove original polygon
-          cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
-          basepoly = gdspy.Polygon(new_points, layer=poly_layer, datatype=poly_purpose)
-          cell.add(basepoly)
+          remove.append(poly)
+          add.append(gdstk.Polygon(new_points, layer=poly_layer, datatype=poly_purpose))
 
 
       # -------- Check for layer or purpose on delete list ---------
       if ((poly_layer in delete_layers_list) or (poly_purpose in delete_purpose_list)):
-        # invalidate original polygon
-        # mark by assigning layer 0
-        poly.layers=[0]
-        # remove original polygon that is now on layer 0
-        cell.remove_polygons(lambda pts, layer, datatype:layer == 0)
+        if not remove or remove[-1] is not poly:
+          remove.append(poly)
+
+    if remove:
+      cell.remove(*remove)
+    if add:
+      cell.add(*add)
 
   # -------- Detect and delete thin ring/frame structures on the periphery ---------
   # This runs at the hierarchy level (a seal ring is typically built from several
@@ -230,7 +240,7 @@ def main():
   # -------- Final polygon validity check/repair (always runs) --------
   # catches any polygon still geometrically invalid (self-intersecting) no
   # matter the reason - a solid-body mesher like gds2palace cannot handle
-  # this even though gdspy/GDSII themselves tolerate it.
+  # this even though GDSII itself tolerates it.
   print()
   repaired_count, unresolved = validate_and_repair_polygons(output_library, layers_list)
   if repaired_count:
@@ -244,7 +254,9 @@ def main():
     print('  Final validity check: no invalid polygons found')
 
   # write to output file
-  output_library.write_gds(output_name)
+  # max_points: gdstk would otherwise fracture every polygon over 199
+  # vertices on writing, gdspy didn't
+  output_library.write_gds(output_name, max_points=8190)
 
   print('\n\nFINISHED: Created output file ', output_name)
 

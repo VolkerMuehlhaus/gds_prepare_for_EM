@@ -1,7 +1,7 @@
 # tools/gds_diff: a summary line also for identical files, paths counted, cells with references, --flat for a layout
 # against a renamed, flattened result.
 
-import gdspy
+import gdstk
 
 import gds_diff
 from conftest import write_gds
@@ -16,10 +16,9 @@ def test_identical_files_say_so(tmp_path, capsys):
 def test_paths_are_compared(tmp_path, capsys):
     paths = []
     for name, width in (("a", 1.0), ("b", 2.0)):
-        lib = gdspy.GdsLibrary()
-        cell = gdspy.Cell("TOP", exclude_from_current=True)
-        cell.add(gdspy.FlexPath([(0, 0), (10, 0)], width, layer=8))
-        lib.add(cell)
+        lib = gdstk.Library()
+        cell = lib.new_cell("TOP")
+        cell.add(gdstk.FlexPath([(0, 0), (10, 0)], width, layer=8, simple_path=True))
         lib.write_gds(str(tmp_path / f"{name}.gds"))
         paths.append(str(tmp_path / f"{name}.gds"))
     assert gds_diff.diff(*paths) == 1

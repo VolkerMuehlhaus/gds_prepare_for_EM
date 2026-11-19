@@ -38,9 +38,12 @@
 ########################################################################
 
 import math
+import time
+from collections import defaultdict
 
-import gdspy
+import gdstk
 import numpy as np
+import shapely
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid, explain_validity
@@ -79,15 +82,17 @@ def decompose_polygon_holes(points, min_hole_area=1e-6):
         # make_valid() decides what is inside from the noded lines, so it can
         # drop a part of the shape: a slit that runs along a hole edge (as
         # KLayout writes it) passes the root of a strip reaching into the hole
-        # twice, and the strip then counts as part of the hole. gdspy's boolean
+        # twice, and the strip then counts as part of the hole. The boolean (gdstk)
         # follows the winding of the boundary and keeps it. If the two disagree
-        # on the area, take the shape from gdspy's pieces instead.
-        reference = gdspy.boolean([points], None, "or", max_points=199)
-        if reference is not None and abs(fixed.area - reference.area()) > 1e-9 * reference.area():
+        # on the area, take the shape from the boolean's pieces instead.
+        reference = gdstk.boolean([gdstk.Polygon(points)], [], "or")
+        reference_area = sum(p.area() for p in reference)
+        if reference and abs(fixed.area - reference_area) > 1e-9 * reference_area:
             fixed = None
             for max_points in (8, 6, 5):
-                result = gdspy.boolean([points], None, "or", max_points=max_points)
-                pieces = [ShapelyPolygon(p) for p in result.polygons]
+                # gdstk's fracture (C++): gdspy's pure Python one never returned on some
+                # polygons (e.g. a 432-vertex ground plane with a slit along a hole edge)
+                pieces = [ShapelyPolygon(q.points) for p in reference for q in p.fracture(max_points=max_points)]
                 if all(p.is_valid for p in pieces):
                     fixed = unary_union(pieces)
                     break
@@ -140,31 +145,28 @@ def cut_holes_as_valid_polygons(exterior_coords, holes, layer, datatype,
                                  max_points_candidates=(8, 6, 5)):
     """
     Cut `holes` (a list of shapely Polygons, e.g. from decompose_polygon_holes())
-    out of `exterior_coords` (exterior ring points) using gdspy's own boolean
-    'not' operation, and return the result as a gdspy PolygonSet - or None if
-    no candidate setting produced fully valid output.
+    out of `exterior_coords` (exterior ring points) with gdstk's boolean 'not',
+    and return the result as a list of gdstk Polygons - or None if no
+    candidate setting produced fully valid output.
 
-    Why this isn't just `gdspy.boolean(..., 'not')` with defaults: gdspy's
-    default output for a polygon-with-holes is itself a single self-touching
-    "keyhole" bridge ring - the same style of encoding that caused the
-    problem in the first place, and confirmed (on a real 8-hole cutout) to
-    still be self-intersecting per shapely even after going through gdspy's
-    own boolean engine. Forcing gdspy's `max_points` fracturing (splitting
-    any result over that many vertices into several simple pieces instead of
-    one bridged ring) with a low enough value reliably produces valid,
-    non-self-intersecting pieces instead - so each candidate is tried in
-    turn (least material change first) and validated with shapely before
-    being accepted, since the "right" threshold isn't knowable in advance
-    and depends on the hole layout.
+    Why the result is fractured: a boolean result with holes is a single
+    self-touching "keyhole" ring - the same style of encoding that caused the
+    problem in the first place, and still self-intersecting per shapely.
+    Fracturing it into pieces of at most `max_points` vertices with a low
+    enough value reliably produces valid, non-self-intersecting pieces
+    instead - so each candidate is tried in turn (least material change
+    first) and validated with shapely before being accepted, since the
+    "right" threshold isn't knowable in advance and depends on the hole
+    layout.
     """
     hole_coords = [list(h.exterior.coords) for h in holes]
+    result = gdstk.boolean([exterior_coords], hole_coords, 'not', layer=layer, datatype=datatype)
+    if not result:
+        return None
     for max_points in max_points_candidates:
-        result = gdspy.boolean([exterior_coords], hole_coords, 'not',
-                                max_points=max_points, layer=layer, datatype=datatype)
-        if result is None:
-            continue
-        if all(ShapelyPolygon(p).is_valid for p in result.polygons):
-            return result
+        pieces = [q for p in result for q in p.fracture(max_points=max_points)]
+        if all(ShapelyPolygon(q.points).is_valid for q in pieces):
+            return [gdstk.Polygon(q.points, layer=layer, datatype=datatype) for q in pieces]
     return None
 
 
@@ -196,11 +198,12 @@ def validate_and_repair_polygons(library, layers_list, min_hole_area=1e-6):
     repaired_count = 0
     unresolved = []
 
-    for cell in library:
-        for n, poly in enumerate(list(cell.polygons)):
-            polypoints = poly.polygons[0]
-            poly_layer = poly.layers[0]
-            poly_purpose = poly.datatypes[0]
+    for cell in library.cells:
+        remove, add = [], []
+        for n, poly in enumerate(cell.polygons):
+            polypoints = poly.points
+            poly_layer = poly.layer
+            poly_purpose = poly.datatype
 
             if poly_layer not in layers_list or len(polypoints) < 3:
                 continue
@@ -216,15 +219,19 @@ def validate_and_repair_polygons(library, layers_list, min_hole_area=1e-6):
 
             if fixed is not None:
                 print(cell.name, ': repairing invalid polygon #', str(n), 'layer', str(poly_layer))
-                poly.layers = [0]
-                cell.remove_polygons(lambda pts, layer, datatype: layer == 0)
-                cell.add(fixed)
+                remove.append(poly)
+                add.extend(fixed)
                 repaired_count += 1
             else:
                 reason = explain_validity(shapely_poly)
                 print(cell.name, ': COULD NOT AUTO-REPAIR invalid polygon #', str(n),
                       'layer', str(poly_layer), '-', reason)
                 unresolved.append((cell.name, n, poly_layer, reason))
+        # one removal per cell: removing polygon by polygon scans the whole cell each time
+        if remove:
+            cell.remove(*remove)
+        if add:
+            cell.add(*add)
 
     return repaired_count, unresolved
 
@@ -298,12 +305,269 @@ def simplify_round_polygon_to_octagon(points, min_size=0):
 
 # ============= periphery ring detection =============
 
+class Progress:
+    """Shows that a long loop is alive: "  ... 120000/1451227 vias merged, 12 s" at most every interval seconds,
+    nothing for loops that finish sooner. update(n) before each item (n: its weight, e.g. the vias of a group)."""
+
+    def __init__(self, total, what, interval=10.0):
+        self.total, self.what, self.interval = total, what, interval
+        self.count = 0
+        self.start = self.last = time.monotonic()
+
+    def update(self, n=1):
+        now = time.monotonic()
+        if now - self.last >= self.interval:
+            print(f"  ... {self.count}/{self.total} {self.what}, {now - self.start:.0f} s", flush=True)
+            self.last = now
+        self.count += n
+
+    def done(self):
+        """A last line if any progress line was printed (so the count ends at the total)."""
+        if self.last != self.start:
+            print(f"  ... {self.count}/{self.total} {self.what}, {time.monotonic() - self.start:.0f} s", flush=True)
+
+
+def _reference_matrix(ref):
+    """3x3 affine matrix of a gdstk Reference without its origin and repetition: x reflection first, then
+    magnification and rotation (gdstk's order)."""
+    c, s = math.cos(ref.rotation) * ref.magnification, math.sin(ref.rotation) * ref.magnification
+    rotate = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return rotate @ np.diag([1.0, -1.0 if ref.x_reflection else 1.0, 1.0])
+
+
+def cell_placements(top):
+    """{cell name: (n, 3, 3) array}: the affine matrices that place each cell of top's hierarchy (top included,
+    as the identity) in top's coordinates, one per placement, repetitions resolved."""
+    found = defaultdict(list)
+
+    def walk(cell, matrix):
+        found[cell.name].append(matrix)
+        for ref in cell.references:
+            if not isinstance(ref.cell, gdstk.Cell):
+                continue                       # unresolved reference (cell missing from the file)
+            base = _reference_matrix(ref)
+            rep = ref.repetition
+            offsets = rep.get_offsets() if rep is not None and rep.size > 0 else np.zeros((1, 2))
+            for offset in offsets:
+                shift = np.eye(3)
+                shift[:2, 2] = np.asarray(ref.origin) + offset
+                walk(ref.cell, matrix @ shift @ base)
+
+    walk(top, np.eye(3))
+    return {name: np.array(matrices) for name, matrices in found.items()}
+
+
+class DesignMetal:
+    """The flattened metal of a design per layer (purposes in exclude_purposes left out), for "is there metal
+    inside this hole?" tests in design coordinates. A layer is flattened and indexed on its first use."""
+
+    def __init__(self, design, exclude_purposes=()):
+        self.design = design
+        self.exclude = set(exclude_purposes)
+        self.placements = cell_placements(design)
+        self._trees = {}
+        self._by_layer = None
+        self._own = {}
+
+    def _tree(self, layer):
+        self.snapshot()                          # flattened once (gdstk filters only by layer and datatype)
+        if layer not in self._trees:
+            geoms = _shapely_from_gdstk(self._by_layer.get(layer, []))
+            self._trees[layer] = shapely.STRtree(geoms), geoms
+        return self._trees[layer]
+
+    def snapshot(self):
+        """Flatten the design now, before it gets modified (the test then sees the design as it was read)."""
+        if self._by_layer is None:
+            self._by_layer = defaultdict(list)
+            for p in self.design.get_polygons(include_paths=True):
+                if p.datatype not in self.exclude and p.size >= 3:
+                    self._by_layer[p.layer].append(p)
+
+    def remember(self, cell):
+        """Flatten cell's own metal now, before the design gets modified (see snapshot())."""
+        if cell is not self.design and cell.name not in self._own:
+            by_layer = defaultdict(list)
+            for p in cell.get_polygons(include_paths=True):
+                if p.datatype not in self.exclude and p.size >= 3:
+                    by_layer[p.layer].append(p)
+            self._own[cell.name] = {"polygons": by_layer, "trees": {}}
+
+    def _own_metal(self, cell, layer):
+        """(shapely geometries, STRtree or None) of cell's own metal on layer, with its subcells, in cell's
+        coordinates; cached per cell (flattened once, in the state the design was read)."""
+        if cell is self.design:
+            tree, geoms = self._tree(layer)
+            return geoms, tree
+        self.remember(cell)
+        own = self._own[cell.name]
+        if layer not in own["trees"]:
+            geoms = _shapely_from_gdstk(own["polygons"].get(layer, []))
+            own["trees"][layer] = (geoms, shapely.STRtree(geoms) if len(geoms) else None)
+        return own["trees"][layer]
+
+    @staticmethod
+    def _island_area(pieces, hole, min_area):
+        """Area of the metal islands in hole: pieces (shapely geometries: the polygon around the hole and all metal
+        reaching into it) merged, the parts that lie inside the hole. Metal that touches the polygon around the
+        hole merges with it, it is connected (filling the hole shorts nothing)."""
+        if len(pieces) == 0:
+            return 0.0
+        # clipped to the hole's box first (a large ground plane has thousands of vertices): metal crossing the
+        # hole's edge touches the polygon around it right there, inside the box, so islands stay islands
+        (x0, y0, x1, y1) = hole.bounds
+        window = shapely.box(x0 - 1e-3, y0 - 1e-3, x1 + 1e-3, y1 + 1e-3)
+        clipped = shapely.intersection(shapely.make_valid(np.asarray(pieces, dtype=object)), window)
+        merged = shapely.union_all(clipped)
+        inside = hole.buffer(1e-6)
+        return sum(part.area for part in getattr(merged, "geoms", [merged])
+                   if part.area > min_area and part.within(inside))
+
+    def metal_inside(self, cell, layer, holes, min_area=1e-6):
+        """For each hole (shapely Polygon in cell's coordinates) of a polygon of cell on layer: "none", "own" or
+        "foreign", by the metal islands of layer inside it (metal not connected to the polygon around the hole).
+        "own": islands, all from cell itself (with its subcells), e.g. a fill square in the opening of a grid
+        tile. "foreign": at some placement of the cell, more island area lies inside than the cell brings itself:
+        a circuit or a pad in a ground plane's clearance."""
+        matrices = self.placements.get(cell.name)
+        if matrices is None or not holes:
+            return ["none"] * len(holes)
+        tree, geoms = self._tree(layer)
+        own, own_tree = self._own_metal(cell, layer)
+        result = []
+        for hole in holes:
+            own_area = 0.0
+            if own_tree is not None:
+                own_area = self._island_area(own[own_tree.query(hole, predicate="intersects")], hole, min_area)
+            if cell is self.design:
+                # the design itself: its own metal is all metal there is, islands are the design's own
+                result.append("own" if own_area > min_area else "none")
+                continue
+            ring = np.asarray(hole.exterior.coords)                    # (k, 2), closed
+            placed = np.einsum("pij,kj->pki", matrices, np.hstack([ring, np.ones((len(ring), 1))]))[:, :, :2]
+            placed_holes = shapely.polygons(placed)
+            hole_idx, metal_idx = tree.query(placed_holes, predicate="intersects")
+            design_area = 0.0
+            for k in np.unique(hole_idx):
+                area = self._island_area(geoms[metal_idx[hole_idx == k]], placed_holes[k], min_area)
+                design_area = max(design_area, area)
+                if design_area > own_area + min_area:
+                    break
+            if design_area > own_area + min_area:
+                result.append("foreign")
+            elif own_area > min_area:
+                result.append("own")
+            else:
+                result.append("none")
+        return result
+
+
+SMALL_HOLE_AREA = 25.0   # um^2: empty holes up to this size are filled, larger ones only if their size repeats
+
+
+class CutoutFiller:
+    """Which holes of polygons are density-fill cutouts, to fill (gds_prepare_for_EM STEP 1, gds_simplify).
+
+    A ground plane's clearance around a circuit is a hole too, and so is a one-off opening under a pad; filling
+    them covered the circuit with metal or added metal under pads. A hole is filled only if
+    - no metal island of the same layer from elsewhere in the design lies inside it, at any placement of its cell
+      (purposes in exclude_purposes don't count; metal touching the polygon around the hole is connected to it,
+      no island);
+    - islands of the polygon's own cell inside it (a fill square in the opening of a grid tile) only if that cell
+      is placed at least repeat_count times (a fill tile, not a design drawn in one cell);
+    - an empty hole only if it is at most small_hole_area (um^2), or its size (bounding box) occurs at least
+      repeat_count times on the layer, counting each placement of a cell (density fill, mesh ground planes);
+    - with max_hole_area given, only if it is at most max_hole_area (um^2).
+
+    is_candidate(poly): which polygons to look at (layers, purposes). Built before the library is modified: the
+    tests see the design as read.
+    """
+
+    def __init__(self, library, design, is_candidate, exclude_purposes=(), small_hole_area=SMALL_HOLE_AREA,
+                 repeat_count=20, max_hole_area=None):
+        self.small_hole_area, self.repeat_count, self.max_hole_area = small_hole_area, repeat_count, max_hole_area
+        self.metal = DesignMetal(design, exclude_purposes)
+        self.decomposed = {}
+        self.size_count = defaultdict(int)
+        for cell in library.cells:
+            placed = len(self.metal.placements.get(cell.name, ()))
+            for n, poly in enumerate(cell.polygons):
+                if is_candidate(poly):
+                    decomp = decompose_polygon_holes(poly.points)
+                    if decomp is not None:
+                        self.decomposed[(cell.name, n)] = decomp
+                        for hole in decomp["holes"]:
+                            self.size_count[(poly.layer, self._size_key(hole))] += placed
+        if self.decomposed:
+            self.metal.snapshot()
+            by_name = {c.name: c for c in library.cells}
+            for name in {name for name, _ in self.decomposed}:
+                self.metal.remember(by_name[name])
+
+    @staticmethod
+    def _size_key(hole):
+        (x0, y0, x1, y1) = hole.bounds
+        return tuple(sorted((round(x1 - x0, 3), round(y1 - y0, 3))))   # sorted: a rotated placement counts too
+
+    def holes(self, cell, n):
+        """decompose_polygon_holes() of polygon n of cell, None if it has no holes (or is no candidate)."""
+        return self.decomposed.get((cell.name, n))
+
+    def replacement(self, cell, n, poly):
+        """(polygons, message) for polygon n of cell (it has holes): its solid outline if all holes are filled,
+        valid geometry with the holes kept otherwise; polygons None: leave it as it is (no valid geometry found)."""
+        decomp = self.decomposed[(cell.name, n)]
+        holes = decomp["holes"]
+        placed = len(self.metal.placements.get(cell.name, ()))
+        inside = self.metal.metal_inside(cell, poly.layer, holes)
+        kept, reasons = [], defaultdict(int)
+        for hole, what in zip(holes, inside):
+            if self.max_hole_area is not None and hole.area > self.max_hole_area:
+                why = "larger than max_hole_area"
+            elif what == "foreign":
+                why = "with circuit metal inside"
+            elif what == "own":
+                why = None if placed >= self.repeat_count else "with metal inside"
+            elif hole.area <= self.small_hole_area or \
+                    self.size_count[(poly.layer, self._size_key(hole))] >= self.repeat_count:
+                why = None
+            else:
+                why = "large and not repeated"
+            if why:
+                kept.append(hole)
+                reasons[why] += 1
+        where = f"{cell.name} polygon #{n} layer {poly.layer}"
+        if not kept:
+            return ([gdstk.Polygon(decomp["exterior_coords"], layer=poly.layer, datatype=poly.datatype)],
+                    f"{where}: cutout filled")
+        # holes kept: re-emitted as valid geometry (a keyhole polygon is not valid for a solid-body mesher like
+        # gds2palace), with the filled holes closed
+        reason = ", ".join(f"{count} {why}" for why, count in reasons.items())
+        fixed = cut_holes_as_valid_polygons(decomp["exterior_coords"], kept, poly.layer, poly.datatype)
+        if fixed is None:
+            return None, (f"{where}: WARNING: could not re-encode it with its holes ({reason}) as valid geometry, "
+                          "left as it is")
+        return fixed, f"{where}: keeping {len(kept)} of {len(holes)} holes ({reason}), re-encoded as valid geometry"
+
+
+def _shapely_from_gdstk(polygons):
+    """numpy object array of shapely Polygons of gdstk Polygons (vectorized per vertex count)."""
+    out = np.empty(len(polygons), dtype=object)
+    by_count = defaultdict(list)
+    for i, p in enumerate(polygons):
+        by_count[p.size].append(i)
+    for _, indices in by_count.items():
+        out[indices] = shapely.polygons(np.stack([polygons[i].points for i in indices]))
+    return out
+
+
 def compute_bbox(points_list):
-    """Bounding box, in the same ((xmin,ymin),(xmax,ymax)) format gdspy uses."""
+    """Bounding box, in the same ((xmin,ymin),(xmax,ymax)) format gdstk uses. points_list: point arrays or gdstk
+    Polygons."""
     xs = []
     ys = []
     for pts in points_list:
-        pts = np.asarray(pts)
+        pts = np.asarray(pts.points if isinstance(pts, gdstk.Polygon) else pts)
         if pts.size == 0:
             continue
         xs.append(pts[:, 0])
@@ -315,31 +579,16 @@ def compute_bbox(points_list):
     return (float(xs.min()), float(ys.min())), (float(xs.max()), float(ys.max()))
 
 
-def flatten_subtree_polygons(cell, seen=None):
+def flatten_subtree_polygons(cell):
     """
-    Recursively collect all polygon point arrays reachable from `cell`
-    through CellReference/CellArray (with their transforms applied),
-    without mutating the cell or library.
+    All polygons (gdstk Polygons) reachable from `cell` through references (with
+    their transforms and repetitions applied, paths as polygons), without
+    mutating the cell or library. The cell's own paths count too: before,
+    they were left out, and a circuit block whose wiring is drawn as paths
+    (e.g. an amplifier stage with fill along its border) looked hollow and
+    was deleted as a seal ring.
     """
-    if seen is None:
-        seen = set()
-    if id(cell) in seen:
-        return []
-    seen.add(id(cell))
-
-    points_list = []
-    for poly in cell.polygons:
-        for pts in poly.polygons:
-            points_list.append(pts)
-
-    for ref in cell.references:
-        ref_cell = ref.ref_cell
-        if isinstance(ref_cell, str):
-            continue  # unresolved reference, nothing to flatten
-        for pts in ref.get_polygons():
-            points_list.append(pts)
-
-    return points_list
+    return cell.get_polygons(include_paths=True)
 
 
 def is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold=0.5,
@@ -386,13 +635,29 @@ def is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold=0.5,
     return touches_edge
 
 
+def _shapely_valid_mask(polygons):
+    """Boolean array: which gdstk Polygons shapely considers valid, vectorized per vertex count."""
+    import shapely
+
+    valid = np.zeros(len(polygons), dtype=bool)
+    by_count = defaultdict(list)
+    for i, p in enumerate(polygons):
+        by_count[p.size].append(i)
+    for count, indices in by_count.items():
+        coords = np.stack([polygons[i].points for i in indices])
+        valid[indices] = shapely.is_valid(shapely.polygons(coords))
+    return valid
+
+
 def hollow_core_fraction(points_list, bbox, core_inset_fraction=0.15,
-                          max_single_polygon_area_fraction=0.5):
+                          max_single_polygon_area_fraction=0.5, stop_above=None, batch_size=20000):
     """
-    Union all polygons in `points_list`, inset the candidate's own bbox by
-    core_inset_fraction * min(width, height) on all sides, and measure what
-    fraction of that inset 'core' rectangle is covered by the union.
-    Near 0 => hollow middle => frame/ring shape.
+    Union all polygons in `points_list` (point arrays or gdstk Polygons),
+    inset the candidate's own bbox by core_inset_fraction * min(width,
+    height) on all sides, and measure what fraction of that inset 'core'
+    rectangle is covered by the union. Near 0 => hollow middle =>
+    frame/ring shape. Polygons that are not valid in shapely (e.g.
+    self-touching keyhole outlines) and polygons of zero area don't count.
 
     A single polygon whose own area covers more than
     max_single_polygon_area_fraction of the candidate's bbox area is
@@ -402,33 +667,62 @@ def hollow_core_fraction(points_list, bbox, core_inset_fraction=0.15,
     EDA exports) rather than drawn fill, and letting it dominate the
     coverage measurement would mask genuinely hollow ring geometry
     underneath it.
+
+    stop_above: if given, the polygons are added in batches, largest first,
+    and the result is returned as soon as the coverage so far exceeds it (a
+    lower bound of the full coverage, so the cell is certainly not hollow).
+    Coverages up to stop_above are exact. Without it, the full coverage.
+
+    The union is clipped to the core with gdstk (Clipper), and only polygons
+    whose bounding box reaches into the core take part: a pad frame with
+    millions of fill polygons took minutes in shapely's unary_union of all
+    of them.
     """
     (xmin, ymin), (xmax, ymax) = bbox
     bbox_area = (xmax - xmin) * (ymax - ymin)
 
-    polys = [ShapelyPolygon(p) for p in points_list if len(p) >= 3]
-    polys = [p for p in polys if p.is_valid and p.area > 0]
-    if not polys:
+    polys = [p if isinstance(p, gdstk.Polygon) else gdstk.Polygon(p) for p in points_list]
+    polys = [p for p in polys if p.size >= 3]
+    areas = np.array([p.area() for p in polys])
+    keep = np.flatnonzero(areas > 0)
+    if keep.size == 0:
         return 0.0
     if bbox_area > 0:
         # only drop oversized polygons if other material remains to test
         # against - otherwise a lone solid rectangle (trivially "oversized"
         # relative to its own bbox) would look artificially hollow once
-        # excluded, instead of correctly registering as solid
-        filtered = [p for p in polys if p.area / bbox_area <= max_single_polygon_area_fraction]
-        if filtered:
-            polys = filtered
-    union = unary_union(polys)
+        # excluded, instead of correctly registering as solid. Only valid
+        # polygons count here, as in the coverage.
+        small = keep[areas[keep] / bbox_area <= max_single_polygon_area_fraction]
+        # is any of them valid? checked in batches until the first valid one, not all millions of fill polygons
+        if any(_shapely_valid_mask([polys[i] for i in small[k:k + batch_size]]).any()
+               for k in range(0, small.size, batch_size)):
+            keep = small
 
     inset = core_inset_fraction * min(xmax - xmin, ymax - ymin)
-    core = ShapelyPolygon([
-        (xmin + inset, ymin + inset), (xmax - inset, ymin + inset),
-        (xmax - inset, ymax - inset), (xmin + inset, ymax - inset),
-    ])
-    if core.area <= 0:
+    cx0, cy0, cx1, cy1 = xmin + inset, ymin + inset, xmax - inset, ymax - inset
+    if cx1 <= cx0 or cy1 <= cy0:
         return 0.0
-    covered = union.intersection(core).area
-    return covered / core.area
+    inside = []
+    for i in keep:
+        (px0, py0), (px1, py1) = polys[i].bounding_box()
+        if px1 > cx0 and px0 < cx1 and py1 > cy0 and py0 < cy1:
+            inside.append(i)
+    if not inside:
+        return 0.0
+    inside.sort(key=lambda i: -areas[i])
+    core = gdstk.rectangle((cx0, cy0), (cx1, cy1))
+    core_area = core.area()
+    step = batch_size if stop_above is not None else len(inside)
+    covered_shapes, fraction = [], 0.0
+    for start in range(0, len(inside), step):
+        batch = [polys[i] for i in inside[start:start + step]]
+        batch = [p for p, v in zip(batch, _shapely_valid_mask(batch)) if v]
+        covered_shapes = gdstk.boolean(covered_shapes + batch, core, "and", precision=1e-4)
+        fraction = sum(p.area() for p in covered_shapes) / core_area
+        if stop_above is not None and fraction > stop_above:
+            break
+    return fraction
 
 
 def detect_periphery_ring_cells(library, top_cell_name,
@@ -443,13 +737,15 @@ def detect_periphery_ring_cells(library, top_cell_name,
 
     Returns a list of dicts: {"cell_name", "bbox", "hollow_fraction"}.
     """
-    top = library.cells[top_cell_name]
-    design_bbox = top.get_bounding_box()
+    top = cells_by_name(library)[top_cell_name]
+    design_bbox = top.bounding_box()
     if design_bbox is None:
         return []
 
     candidates = []
-    for cell in library.cells.values():
+    progress = Progress(len(library.cells), "cells")
+    for cell in library.cells:
+        progress.update(1)
         if cell.name == top_cell_name:
             continue
         points_list = flatten_subtree_polygons(cell)
@@ -460,7 +756,7 @@ def detect_periphery_ring_cells(library, top_cell_name,
             continue
         if not is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold):
             continue
-        hollow_frac = hollow_core_fraction(points_list, cell_bbox, core_inset_fraction)
+        hollow_frac = hollow_core_fraction(points_list, cell_bbox, core_inset_fraction, stop_above=hollow_threshold)
         if hollow_frac <= hollow_threshold:
             candidates.append({
                 "cell_name": cell.name,
@@ -473,15 +769,15 @@ def detect_periphery_ring_cells(library, top_cell_name,
 def collect_referenced_cell_names(cell, seen=None):
     """
     Recursively collect the names of every distinct cell reachable from
-    `cell` through CellReference/CellArray (not including `cell` itself).
+    `cell` through references (not including `cell` itself).
     """
     if seen is None:
         seen = set()
     names = []
     for ref in cell.references:
-        ref_cell = ref.ref_cell
-        if isinstance(ref_cell, str) or ref_cell.name in seen:
-            continue
+        ref_cell = ref.cell
+        if not isinstance(ref_cell, gdstk.Cell) or ref_cell.name in seen:
+            continue  # unresolved reference (cell missing from the file)
         seen.add(ref_cell.name)
         names.append(ref_cell.name)
         names.extend(collect_referenced_cell_names(ref_cell, seen))
@@ -496,12 +792,13 @@ def delete_polygons_in_cells(library, cell_names):
     Returns {cell_name: number_of_polygons_removed}.
     """
     removed_counts = {}
+    by_name = cells_by_name(library)
     for name in cell_names:
-        cell = library.cells.get(name)
+        cell = by_name.get(name)
         if cell is None:
             continue
         removed_counts[name] = len(cell.polygons)
-        cell.polygons = []
+        cell.remove(*cell.polygons)
     return removed_counts
 
 
@@ -532,8 +829,9 @@ def detect_and_delete_periphery_rings(library, top_cell_name, apply=True,
               f"hollow_fraction={candidate['hollow_fraction']:.3f}")
 
     if apply:
+        by_name = cells_by_name(library)
         for candidate in candidates:
-            cell = library.cells.get(candidate["cell_name"])
+            cell = by_name.get(candidate["cell_name"])
             if cell is None:
                 continue
             # A ring candidate is often a wrapper cell that only holds
@@ -558,17 +856,21 @@ def design_cell(lib, name=None):
     """(cell, names of the other top-level cells) of the design to prepare: the cell called name, else the top-level
     cell with the largest bounding box. KLayout's $$$CONTEXT_INFO$$$ (and other $$$ cells) never count. A file can
     have several top-level cells, e.g. device cells placed nowhere; taking the first one prepared the wrong cell.
-    Raises ValueError if there is no such cell."""
-    tops = [c for c in lib.top_level() if not c.name.startswith("$$$")]
+    Raises ValueError if there is no such cell.
+
+    The same rule as gds2palace's and gds2openEMS's select_design_cell() (util_gds_reader), so all tools take the
+    same cell when none is named: keep them in sync."""
+    tops = [c for c in lib.top_level() if not isinstance(c, gdstk.RawCell) and not c.name.startswith("$$$")]
     if name:
-        if name not in lib.cells:
+        by_name = cells_by_name(lib)
+        if name not in by_name:
             raise ValueError(f"no cell {name} in the file; top-level cells: {', '.join(c.name for c in tops)}")
-        return lib.cells[name], [c.name for c in tops if c.name != name]
+        return by_name[name], [c.name for c in tops if c.name != name]
     if not tops:
         raise ValueError("no design cell in the file")
 
     def area(cell):
-        box = cell.get_bounding_box()
+        box = cell_bounding_box(cell)
         return 0 if box is None else (box[1][0] - box[0][0]) * (box[1][1] - box[0][1])
     cell = max(tops, key=area)
     return cell, [c.name for c in tops if c is not cell]
@@ -576,6 +878,45 @@ def design_cell(lib, name=None):
 
 def only_cell(lib, cell):
     """A library with cell and its subcells only (unit and precision of lib)."""
-    out = gdspy.GdsLibrary(unit=lib.unit, precision=lib.precision)
-    out.add(cell, include_dependencies=True)
+    out = gdstk.Library(name=lib.name, unit=lib.unit, precision=lib.precision)
+    out.add(cell, *cell.dependencies(True))
     return out
+
+
+# ============= gdstk helpers =============
+
+def cells_by_name(lib):
+    """{name: cell} of a gdstk Library."""
+    return {c.name: c for c in lib.cells}
+
+
+def polygons_by_spec(cell, depth=None):
+    """{(layer, datatype): [point arrays]} of a cell's polygons and paths (as polygons). depth=0: the cell's own
+    shapes only, None: the whole hierarchy flattened."""
+    result = defaultdict(list)
+    for p in cell.get_polygons(depth=depth, include_paths=True):
+        result[(p.layer, p.datatype)].append(p.points)
+    return dict(result)
+
+
+def cell_bounding_box(cell):
+    """((xmin, ymin), (xmax, ymax)) of a cell, None if empty."""
+    return cell.bounding_box()
+
+
+def cell_layers(cell):
+    """Set of the layer numbers used in cell and its subcells (polygons and paths)."""
+    layers = set()
+    for c in [cell] + list(cell.dependencies(True)):
+        if isinstance(c, gdstk.Cell):
+            layers.update(p.layer for p in c.polygons)
+            for path in c.paths:
+                layers.update(path.layers)
+    return layers
+
+
+def flat_polygon_cell(cell, name=None):
+    """A new cell holding cell's whole hierarchy flattened, paths converted to polygons."""
+    flat = gdstk.Cell(name or cell.name)
+    flat.add(*cell.get_polygons(include_paths=True))
+    return flat
