@@ -38,6 +38,7 @@
 ########################################################################
 
 import math
+import time
 from collections import defaultdict
 
 import gdstk
@@ -303,12 +304,35 @@ def simplify_round_polygon_to_octagon(points, min_size=0):
 
 # ============= periphery ring detection =============
 
+class Progress:
+    """Shows that a long loop is alive: "  ... 120000/1451227 vias merged, 12 s" at most every interval seconds,
+    nothing for loops that finish sooner. update(n) before each item (n: its weight, e.g. the vias of a group)."""
+
+    def __init__(self, total, what, interval=10.0):
+        self.total, self.what, self.interval = total, what, interval
+        self.count = 0
+        self.start = self.last = time.monotonic()
+
+    def update(self, n=1):
+        now = time.monotonic()
+        if now - self.last >= self.interval:
+            print(f"  ... {self.count}/{self.total} {self.what}, {now - self.start:.0f} s", flush=True)
+            self.last = now
+        self.count += n
+
+    def done(self):
+        """A last line if any progress line was printed (so the count ends at the total)."""
+        if self.last != self.start:
+            print(f"  ... {self.count}/{self.total} {self.what}, {time.monotonic() - self.start:.0f} s", flush=True)
+
+
 def compute_bbox(points_list):
-    """Bounding box, in the same ((xmin,ymin),(xmax,ymax)) format gdstk uses."""
+    """Bounding box, in the same ((xmin,ymin),(xmax,ymax)) format gdstk uses. points_list: point arrays or gdstk
+    Polygons."""
     xs = []
     ys = []
     for pts in points_list:
-        pts = np.asarray(pts)
+        pts = np.asarray(pts.points if isinstance(pts, gdstk.Polygon) else pts)
         if pts.size == 0:
             continue
         xs.append(pts[:, 0])
@@ -322,14 +346,14 @@ def compute_bbox(points_list):
 
 def flatten_subtree_polygons(cell):
     """
-    All polygon point arrays reachable from `cell` through references (with
+    All polygons (gdstk Polygons) reachable from `cell` through references (with
     their transforms and repetitions applied, paths as polygons), without
     mutating the cell or library. The cell's own paths count too: before,
     they were left out, and a circuit block whose wiring is drawn as paths
     (e.g. an amplifier stage with fill along its border) looked hollow and
     was deleted as a seal ring.
     """
-    return [p.points for p in cell.get_polygons(include_paths=True)]
+    return cell.get_polygons(include_paths=True)
 
 
 def is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold=0.5,
@@ -376,13 +400,29 @@ def is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold=0.5,
     return touches_edge
 
 
+def _shapely_valid_mask(polygons):
+    """Boolean array: which gdstk Polygons shapely considers valid, vectorized per vertex count."""
+    import shapely
+
+    valid = np.zeros(len(polygons), dtype=bool)
+    by_count = defaultdict(list)
+    for i, p in enumerate(polygons):
+        by_count[p.size].append(i)
+    for count, indices in by_count.items():
+        coords = np.stack([polygons[i].points for i in indices])
+        valid[indices] = shapely.is_valid(shapely.polygons(coords))
+    return valid
+
+
 def hollow_core_fraction(points_list, bbox, core_inset_fraction=0.15,
-                          max_single_polygon_area_fraction=0.5):
+                          max_single_polygon_area_fraction=0.5, stop_above=None, batch_size=20000):
     """
-    Union all polygons in `points_list`, inset the candidate's own bbox by
-    core_inset_fraction * min(width, height) on all sides, and measure what
-    fraction of that inset 'core' rectangle is covered by the union.
-    Near 0 => hollow middle => frame/ring shape.
+    Union all polygons in `points_list` (point arrays or gdstk Polygons),
+    inset the candidate's own bbox by core_inset_fraction * min(width,
+    height) on all sides, and measure what fraction of that inset 'core'
+    rectangle is covered by the union. Near 0 => hollow middle =>
+    frame/ring shape. Polygons that are not valid in shapely (e.g.
+    self-touching keyhole outlines) and polygons of zero area don't count.
 
     A single polygon whose own area covers more than
     max_single_polygon_area_fraction of the candidate's bbox area is
@@ -392,33 +432,62 @@ def hollow_core_fraction(points_list, bbox, core_inset_fraction=0.15,
     EDA exports) rather than drawn fill, and letting it dominate the
     coverage measurement would mask genuinely hollow ring geometry
     underneath it.
+
+    stop_above: if given, the polygons are added in batches, largest first,
+    and the result is returned as soon as the coverage so far exceeds it (a
+    lower bound of the full coverage, so the cell is certainly not hollow).
+    Coverages up to stop_above are exact. Without it, the full coverage.
+
+    The union is clipped to the core with gdstk (Clipper), and only polygons
+    whose bounding box reaches into the core take part: a pad frame with
+    millions of fill polygons took minutes in shapely's unary_union of all
+    of them.
     """
     (xmin, ymin), (xmax, ymax) = bbox
     bbox_area = (xmax - xmin) * (ymax - ymin)
 
-    polys = [ShapelyPolygon(p) for p in points_list if len(p) >= 3]
-    polys = [p for p in polys if p.is_valid and p.area > 0]
-    if not polys:
+    polys = [p if isinstance(p, gdstk.Polygon) else gdstk.Polygon(p) for p in points_list]
+    polys = [p for p in polys if p.size >= 3]
+    areas = np.array([p.area() for p in polys])
+    keep = np.flatnonzero(areas > 0)
+    if keep.size == 0:
         return 0.0
     if bbox_area > 0:
         # only drop oversized polygons if other material remains to test
         # against - otherwise a lone solid rectangle (trivially "oversized"
         # relative to its own bbox) would look artificially hollow once
-        # excluded, instead of correctly registering as solid
-        filtered = [p for p in polys if p.area / bbox_area <= max_single_polygon_area_fraction]
-        if filtered:
-            polys = filtered
-    union = unary_union(polys)
+        # excluded, instead of correctly registering as solid. Only valid
+        # polygons count here, as in the coverage.
+        small = keep[areas[keep] / bbox_area <= max_single_polygon_area_fraction]
+        # is any of them valid? checked in batches until the first valid one, not all millions of fill polygons
+        if any(_shapely_valid_mask([polys[i] for i in small[k:k + batch_size]]).any()
+               for k in range(0, small.size, batch_size)):
+            keep = small
 
     inset = core_inset_fraction * min(xmax - xmin, ymax - ymin)
-    core = ShapelyPolygon([
-        (xmin + inset, ymin + inset), (xmax - inset, ymin + inset),
-        (xmax - inset, ymax - inset), (xmin + inset, ymax - inset),
-    ])
-    if core.area <= 0:
+    cx0, cy0, cx1, cy1 = xmin + inset, ymin + inset, xmax - inset, ymax - inset
+    if cx1 <= cx0 or cy1 <= cy0:
         return 0.0
-    covered = union.intersection(core).area
-    return covered / core.area
+    inside = []
+    for i in keep:
+        (px0, py0), (px1, py1) = polys[i].bounding_box()
+        if px1 > cx0 and px0 < cx1 and py1 > cy0 and py0 < cy1:
+            inside.append(i)
+    if not inside:
+        return 0.0
+    inside.sort(key=lambda i: -areas[i])
+    core = gdstk.rectangle((cx0, cy0), (cx1, cy1))
+    core_area = core.area()
+    step = batch_size if stop_above is not None else len(inside)
+    covered_shapes, fraction = [], 0.0
+    for start in range(0, len(inside), step):
+        batch = [polys[i] for i in inside[start:start + step]]
+        batch = [p for p, v in zip(batch, _shapely_valid_mask(batch)) if v]
+        covered_shapes = gdstk.boolean(covered_shapes + batch, core, "and", precision=1e-4)
+        fraction = sum(p.area() for p in covered_shapes) / core_area
+        if stop_above is not None and fraction > stop_above:
+            break
+    return fraction
 
 
 def detect_periphery_ring_cells(library, top_cell_name,
@@ -439,7 +508,9 @@ def detect_periphery_ring_cells(library, top_cell_name,
         return []
 
     candidates = []
+    progress = Progress(len(library.cells), "cells")
     for cell in library.cells:
+        progress.update(1)
         if cell.name == top_cell_name:
             continue
         points_list = flatten_subtree_polygons(cell)
@@ -450,7 +521,7 @@ def detect_periphery_ring_cells(library, top_cell_name,
             continue
         if not is_ring_candidate(cell_bbox, design_bbox, extent_fraction_threshold):
             continue
-        hollow_frac = hollow_core_fraction(points_list, cell_bbox, core_inset_fraction)
+        hollow_frac = hollow_core_fraction(points_list, cell_bbox, core_inset_fraction, stop_above=hollow_threshold)
         if hollow_frac <= hollow_threshold:
             candidates.append({
                 "cell_name": cell.name,

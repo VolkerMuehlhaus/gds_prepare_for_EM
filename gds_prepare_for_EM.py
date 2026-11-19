@@ -22,6 +22,7 @@
 
 import argparse
 import sys
+import time
 import gdstk
 from collections import defaultdict
 from rtree import index  # pip install rtree
@@ -44,6 +45,7 @@ from gds_geometry_utils import (
     polygons_by_spec,
     cell_layers,
     flat_polygon_cell,
+    Progress,
 )
 
 __version__ = "1.8.0"
@@ -57,6 +59,7 @@ RING_HOLE_FRACTION_THRESHOLD = 0.90
 # connect the same metal shapes above and below. Larger than the largest
 # IHP SG13G2 via spacing (TopVia2: 1.06 um), so every regular array merges.
 DEFAULT_VIA_MERGE_SIZE = 2.0
+VIA_TILE_SIZE = 2000      # vias per tile when growing a large via group (_merge_via_group)
 
 
 # Step 1: single source of truth for layer number <-> name. To adapt this
@@ -345,7 +348,10 @@ def _best_overlapping_polygons(vias, metals):
     return best
   metals = np.array(metals, dtype=object)
   shapely.prepare(metals)
-  via_idx, metal_idx = shapely.STRtree(metals).query(vias, predicate='intersects')
+  # the vias in the tree, the metal shapes as query: a query geometry is prepared once and tested against its
+  # candidates. The other way round, each of up to millions of vias was tested against a large metal shape
+  # (a ground plane with thousands of vertices) unprepared: minutes on a layout with fill vias.
+  metal_idx, via_idx = shapely.STRtree(vias).query(metals, predicate='intersects')
   if not len(via_idx):
     return best
   covered = shapely.covers(metals[metal_idx], vias[via_idx])
@@ -360,6 +366,21 @@ def _best_overlapping_polygons(vias, metals):
   return best
 
 
+def _spatial_tiles(polygons, per_tile=VIA_TILE_SIZE):
+  """Index lists of the polygons, grouped by a square grid over their centers, about per_tile polygons per grid
+  cell. Up to per_tile polygons: one list of all, in their order."""
+  if len(polygons) <= per_tile:
+    return [list(range(len(polygons)))]
+  centers = np.array([np.asarray(p).mean(axis=0) for p in polygons])
+  (x0, y0), (x1, y1) = centers.min(axis=0), centers.max(axis=0)
+  cells = max(1, int(np.sqrt(len(polygons) / per_tile)))
+  ix = np.minimum(((centers[:, 0] - x0) / max(x1 - x0, 1e-9) * cells).astype(int), cells - 1)
+  iy = np.minimum(((centers[:, 1] - y0) / max(y1 - y0, 1e-9) * cells).astype(int), cells - 1)
+  key = ix * cells + iy
+  order = np.argsort(key, kind="stable")
+  return [list(part) for part in np.split(order, np.flatnonzero(np.diff(key[order])) + 1)]
+
+
 def _merge_via_group(via_polygons, maxspacing):
   """
   Merge vias closer than maxspacing: oversize by half the spacing, OR,
@@ -372,8 +393,13 @@ def _merge_via_group(via_polygons, maxspacing):
   # slit from the outline to each hole), and a fractured shape is pieces with shared edges. Shrunk on its own, a
   # slit widens and a shared edge opens, each cutting a strip out of the via. Joined first, a slit is a hole again
   # and the pieces are one shape.
-  grown = gdstk.offset([np.asarray(p) for p in via_polygons], offset, join='miter', tolerance=2, precision=0.001,
-                       use_union=True)
+  # grown tile by tile: growing distributes over the union (a convex corner of the union is a corner of one via,
+  # a concave one the crossing of two grown edges), so the merged result is the same, and Clipper is much faster
+  # on many small inputs than on one large one (1.3 million fill vias under a pad frame: 3 s instead of 33 s)
+  grown = []
+  for tile in _spatial_tiles(via_polygons):
+    grown += gdstk.offset([np.asarray(via_polygons[i]) for i in tile], offset, join='miter', tolerance=2,
+                          precision=0.001, use_union=True)
   merged = gdstk.boolean(grown, [], "or")
   shrunk = gdstk.offset(merged, -offset, join='miter', tolerance=2, precision=0.001, use_union=True)
   if not shrunk:
@@ -447,13 +473,16 @@ def merge_via_array_by_metal_overlap(via_polygons, above_polygons, below_polygon
     pair_vias[(int(above_i), int(below_i))].append(via_pts)
 
   merged_points = []
+  progress = Progress(sum(len(v) for v in pair_vias.values()), "vias merged")
   for (above_i, below_i), vias in pair_vias.items():
+    progress.update(len(vias))
     overlap = above_shapely[above_i].intersection(below_shapely[below_i])
     for merged in _merge_via_group(vias, maxspacing):
       clipped = merged.intersection(overlap)
       for part in getattr(clipped, 'geoms', [clipped]):
         if part.geom_type == 'Polygon' and part.area > 0:
           merged_points.extend(_polygon_to_points(part))
+  progress.done()
   if keep_unmatched:
     merged_points.extend(unmatched)
   return merged_points
@@ -635,7 +664,7 @@ def merge_via_arrays_in_cell (input_cell, layers_list, maxspacing=DEFAULT_VIA_ME
                 if (layer==layer_to_extract_gds) and (purpose not in exclude_purpose_list):
                     layerpolygons = LPPpolylist[(layer, purpose)]
                     numpoly = len(layerpolygons)
-                    print(f"Number of polygons on layer {layer}:{purpose}: {numpoly}")
+                    print(f"Number of polygons on layer {layer}:{purpose}: {numpoly}", flush=True)
 
                     if layer in layer_above_dict and maxspacing > 0:
                         # via layer: replace the via array with clean solid
@@ -644,9 +673,12 @@ def merge_via_arrays_in_cell (input_cell, layers_list, maxspacing=DEFAULT_VIA_ME
                         layer_above_polygons = LPPpolylist.get((layer_above_dict[layer], 0), [])  # drawing
                         layer_below_polygons = LPPpolylist.get((layer_below_dict[layer], 0), [])  # drawing
 
+                        started = time.monotonic()
                         merged_points = merge_via_array_by_metal_overlap(
                             layerpolygons, layer_above_polygons, layer_below_polygons, maxspacing
                         )
+                        print(f"  merged into {len(merged_points)} via polygons "
+                              f"({time.monotonic() - started:.1f} s)", flush=True)
                         new_cell.add(*[gdstk.Polygon(pts, layer=layer, datatype=purpose) for pts in merged_points])
 
                     else:
@@ -668,7 +700,9 @@ def remove_cutout_keep_hierarchy (library, layers_list, design_bbox=None, max_ho
   gates the "genuine cutout" branch, not thin-ring detection/deletion.
   """
   # iterate over cells
+  progress = Progress(len(library.cells), "cells")
   for cell in library.cells:
+    progress.update(1)
     # polygons to remove and to add, applied once per cell after the loop:
     # removing polygon by polygon scanned the whole cell each time
     remove, add = [], []
@@ -789,6 +823,29 @@ def print_run_config(parser, args):
     print()
 
 
+class _StepTimer:
+    """Prints how long each STEP took, and the total, so a long run shows where the time goes."""
+
+    def __init__(self):
+        self.start_time = self.step_time = time.monotonic()
+        self.step = None
+
+    def next(self, title):
+        self.finish()
+        print(title, flush=True)
+        self.step = title.split(":")[0].strip()
+        self.step_time = time.monotonic()
+
+    def finish(self):
+        if self.step is not None:
+            print(f"  {self.step} took {time.monotonic() - self.step_time:.1f} s", flush=True)
+        self.step = None
+
+    def total(self):
+        self.finish()
+        return time.monotonic() - self.start_time
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare IHP SG13G2 GDSII layout for EM simulation.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -819,6 +876,7 @@ def main():
     output_name = args.output_gds if args.output_gds else input_name.replace('.gds', '_cleaned.gds')
 
     print ("Input file: ", input_name)
+    steps = _StepTimer()
 
     # All steps run in memory (gdstk). gdspy needed a GDS write+read between
     # steps, its flatten() failed on some in-memory reference structures.
@@ -840,7 +898,7 @@ def main():
     # STEP 1: remove cutouts in the hierachical design, don't flatten at this stage
     # do this on metal layers (not via layers, not EM port layers)
     hole_area_desc = f'<= {args.max_hole_area}' if args.max_hole_area is not None else 'any size'
-    print(f"\nSTEP 1: remove cutouts in the hierachical design ({hole_area_desc}), don't flatten at this stage")
+    steps.next(f"\nSTEP 1: remove cutouts in the hierachical design ({hole_area_desc}), don't flatten at this stage")
     lib = remove_cutout_keep_hierarchy (lib, metal_layers_list, design_bbox=design_bbox,
                                          max_hole_area=args.max_hole_area)
 
@@ -848,7 +906,7 @@ def main():
     # (e.g. seal rings). This has to run before via array merging, since it
     # needs the design hierarchy intact (a seal ring is typically built
     # from several segment cells, not one polygon-with-hole).
-    print(f"\nSTEP 2: detect periphery ring/frame structures (e.g. seal rings)")
+    steps.next(f"\nSTEP 2: detect periphery ring/frame structures (e.g. seal rings)")
     if top_cell_name is not None:
         detect_and_delete_periphery_rings(lib, top_cell_name, apply=True)
 
@@ -863,7 +921,7 @@ def main():
     layers_list.extend(sorted(layer for layer in design_layers if layer > 200 and layer not in layers_list))
 
     # STEP 3: via array merging, this also flattens the design hierarchy
-    print(f'\nSTEP 3: via array merging (distance {args.via_merge_size} um), this also flattens the design hierarchy')
+    steps.next(f'\nSTEP 3: via array merging (distance {args.via_merge_size} um), this also flattens the design hierarchy')
     merged_lib = merge_via_arrays_in_cell (design, layers_list, args.via_merge_size)
 
     # STEP 4: replace circle-like polygons by octagons. This has to run
@@ -877,7 +935,7 @@ def main():
     # get simplified. Floating round pads aren't affected either way, but
     # connected ones only stay detectable if this runs first.
     minsize=10
-    print(f'\nSTEP 4: replace circle-like polygons by octagons if diameter > {minsize}')
+    steps.next(f'\nSTEP 4: replace circle-like polygons by octagons if diameter > {minsize}')
     convert_lib = replace_circles (merged_lib, metal_layers_list, min_size=minsize)
 
     # STEP 5: merge (boolean OR) polygons within each layer/datatype. This has
@@ -889,7 +947,7 @@ def main():
     # cluster of fill units into its own small isolated polygon, while real
     # connected metal (including the octagons from STEP 4, if they touch a
     # trace) merges into one (or a few) large, usually unique shape.
-    print('\nSTEP 5: merge polygons per layer')
+    steps.next('\nSTEP 5: merge polygons per layer')
     convert_top = convert_lib.top_level()[0]
     merged_by_layer_lib = merge_polygons_by_layer(convert_top, layers_list=layers_list)
 
@@ -899,7 +957,7 @@ def main():
     # repeats >= --fill-mincount times on a layer are filled, so a one-off
     # opening enclosed by merging (e.g. an antenna aperture) stays open.
     hole_area_desc = f', area <= {args.max_hole_area}' if args.max_hole_area is not None else ''
-    print(f'\nSTEP 5b: fill holes created by merging, if the same size repeats >= {args.fill_mincount} times per layer{hole_area_desc}')
+    steps.next(f'\nSTEP 5b: fill holes created by merging, if the same size repeats >= {args.fill_mincount} times per layer{hole_area_desc}')
     merged_top = merged_by_layer_lib.top_level()[0]
     holes_filled_lib = fill_repeated_holes_by_layer(merged_top, metal_layers_list, mincount=args.fill_mincount,
                                                     max_hole_area=args.max_hole_area)
@@ -912,7 +970,7 @@ def main():
     maxsize = args.fill_maxsize
     mincount = args.fill_mincount
     size_desc = f'{minsize}..{maxsize}' if maxsize is not None else f'>= {minsize} (no upper limit)'
-    print(f'\nSTEP 6: remove floating metals that are not connected to anything, size {size_desc}, repeating >= {mincount} times per size')
+    steps.next(f'\nSTEP 6: remove floating metals that are not connected to anything, size {size_desc}, repeating >= {mincount} times per size')
     premerged_top = holes_filled_lib.top_level()[0]
     nofloat_lib = find_isolated_same_size_polygons_by_layer(premerged_top, metal_layers_list, minsize=minsize, maxsize=maxsize, mincount=mincount)
 
@@ -923,7 +981,7 @@ def main():
     # steps happened to touch at all). A solid-body mesher like gds2palace
     # cannot handle this even though GDSII itself tolerates it, so
     # this always runs, not just when other options are given.
-    print('\nSTEP 7: final polygon validity check/repair (always runs)')
+    steps.next('\nSTEP 7: final polygon validity check/repair (always runs)')
     repaired_count, unresolved = validate_and_repair_polygons(nofloat_lib, layers_list)
     if repaired_count:
         print(f'  repaired {repaired_count} invalid polygon(s)')
@@ -937,10 +995,12 @@ def main():
 
     # SAVE RESULTS, in the unit of the input file. max_points: gdstk would
     # otherwise fracture every polygon over 199 vertices on writing, gdspy didn't
+    steps.next("\nWriting the output file")
     nofloat_lib.unit, nofloat_lib.precision = unit, precision
     nofloat_lib.write_gds(output_name, max_points=8190)
 
     print("Created final output file",output_name)
+    print(f"Total time {steps.total():.1f} s")
 
 
 if __name__ == "__main__":

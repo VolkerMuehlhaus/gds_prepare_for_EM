@@ -4,6 +4,8 @@
 
 **Version 1.8: the tools now use gdstk instead of gdspy, and are 3 to 15 times faster.** Layouts where gdspy never finished (it could hang on some polygons with holes) now run in seconds.
 
+Large layouts with millions of fill vias, such as a full chip with its pad frame, are also much faster: seal-ring detection and via merging took minutes there (440 s for one PA chip, now 80 s). On long runs, gds_prepare_for_EM shows how far it is every 10 seconds, and how long each step took.
+
 Results change in three places. Simulations of a layout prepared with 1.8 are not directly comparable with ones prepared with 1.7:
 - **Merged vias are complete.** Before, shrinking a merged via back after merging cut strips of up to about 2 µm out of it, along the slit that encodes a hole and along fracture lines. Rings of vias came out cut open. Merged via area typically goes up by 0.5 to 10%, and by up to 25% on large via fields.
 - **Circuit blocks are no longer deleted as seal rings** when their wiring is drawn as paths and only fill sits along their border.

@@ -35,3 +35,29 @@ def test_metal_in_two_pieces_is_one_shape():
     shape = merged_shape(via_ring(0, 0, 10), above, below)
     assert shape.geom_type == "Polygon" and len(shape.interiors) == 1
     assert abs(shape.area - (9.5 * 9.5 - 8.5 * 8.5)) < 1e-6
+
+
+def test_large_via_group_merged_in_tiles_gives_the_same_shape(monkeypatch):
+    """A large via group is grown tile by tile (much faster in Clipper); the merged shape is the same as grown in
+    one piece. Irregular field: rows with gaps, rotated (octagon-like) vias, an opening in the middle."""
+    import gds_prepare_for_EM as prep
+
+    rng = np.random.default_rng(1)
+    vias = []
+    for i in range(70):
+        for j in range(70):
+            if 30 <= i < 40 and 30 <= j < 40 or rng.random() < 0.1:
+                continue
+            x, y = i * 1.3 + rng.random() * 0.2, j * 1.1
+            if (i + j) % 7 == 0:
+                vias.append(np.array([(x + 0.2, y), (x + 0.4, y), (x + 0.6, y + 0.2), (x + 0.6, y + 0.4),
+                                      (x + 0.4, y + 0.6), (x + 0.2, y + 0.6), (x, y + 0.4), (x, y + 0.2)]))
+            else:
+                vias.append(np.array([(x, y), (x + 0.5, y), (x + 0.5, y + 0.5), (x, y + 0.5)]))
+    assert len(prep._spatial_tiles(vias, per_tile=200)) > 10
+    monkeypatch.setattr(prep._spatial_tiles, "__defaults__", (10 ** 9,))
+    one_piece = unary_union(prep._merge_via_group(vias, 0.6))
+    monkeypatch.setattr(prep._spatial_tiles, "__defaults__", (200,))
+    tiled = unary_union(prep._merge_via_group(vias, 0.6))
+    assert one_piece.area > 0 and abs(tiled.area - one_piece.area) < 1e-6 * one_piece.area
+    assert one_piece.symmetric_difference(tiled).area < 1e-6
